@@ -10,7 +10,7 @@ No server. No account. No external API calls. Just a Chrome extension.
 
 ## Install with a coding agent
 
-Send your coding agent (Claude Code, Cursor, Windsurf, etc.) this repo and say **"install this"**:
+Send your coding agent (Claude Code, Codex, etc.) this repo and say **"install this"**:
 
 ```
 https://github.com/zarazhangrui/tab-out
