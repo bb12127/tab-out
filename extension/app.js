@@ -40,13 +40,19 @@ async function fetchOpenTabs() {
 
     const tabs = await chrome.tabs.query({});
     openTabs = tabs.map(t => ({
-      id:       t.id,
-      url:      t.url,
-      title:    t.title,
-      windowId: t.windowId,
-      active:   t.active,
+      id:            t.id,
+      url:           t.url,
+      title:         t.title,
+      windowId:      t.windowId,
+      active:        t.active,
+      index:         t.index,   // position in the tab strip — used for workspace ordering & tab-restore
+      // Opera GX exposes these; other Chromium browsers leave them undefined.
+      // No icon field is exposed — workspace icons come from chrome.storage.local
+      // and are managed via the in-UI emoji picker (the pencil on each pill).
+      workspaceId:   t.workspaceId,
+      workspaceName: t.workspaceName,
       // Flag Tab Out's own pages so we can detect duplicate new tabs
-      isTabOut: t.url === newtabUrl || t.url === 'chrome://newtab/',
+      isTabOut:      t.url === newtabUrl || t.url === 'chrome://newtab/',
     }));
   } catch {
     // chrome.tabs API unavailable (shouldn't happen in an extension page)
@@ -228,12 +234,20 @@ async function closeTabOutDupes() {
 async function saveTabForLater(tab) {
   const { deferred = [] } = await chrome.storage.local.get('deferred');
   deferred.push({
-    id:        Date.now().toString(),
-    url:       tab.url,
-    title:     tab.title,
-    savedAt:   new Date().toISOString(),
-    completed: false,
-    dismissed: false,
+    id:            Date.now().toString(),
+    url:           tab.url,
+    title:         tab.title,
+    // Remember the Opera GX workspace so restore can put it back where it came
+    // from. Older entries lack this and will restore into the active workspace.
+    workspaceId:   tab.workspaceId   || null,
+    workspaceName: tab.workspaceName || null,
+    // Remember the original tab strip position too — restore will try to put
+    // the tab back at this index (clamped to current tab count by Chrome).
+    index:         (typeof tab.index === 'number') ? tab.index : null,
+    windowId:      tab.windowId || null,
+    savedAt:       new Date().toISOString(),
+    completed:     false,
+    dismissed:     false,
   });
   await chrome.storage.local.set({ deferred });
 }
@@ -281,6 +295,219 @@ async function dismissSavedTab(id) {
     tab.dismissed = true;
     await chrome.storage.local.set({ deferred });
   }
+}
+
+/**
+ * restoreArchivedTab(id)
+ *
+ * Moves an archived (completed) tab back to the active "Saved for Later" list.
+ */
+async function restoreArchivedTab(id) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const tab = deferred.find(t => t.id === id);
+  if (tab) {
+    tab.completed = false;
+    delete tab.completedAt;
+    await chrome.storage.local.set({ deferred });
+  }
+}
+
+
+/* ----------------------------------------------------------------
+   GROUPED DEFERRED ENTRIES
+
+   In addition to individual tabs, the 'deferred' storage array can
+   also hold "group" entries that bundle multiple tabs saved together
+   from a single domain card. Shape:
+
+     {
+       id, kind: 'group',
+       label, domain,                 // for rendering (favicon lookup etc.)
+       savedAt, completedAt?,
+       completed, dismissed,          // same lifecycle flags as tabs
+       items: [
+         { id, url, title,
+           workspaceId, workspaceName, index, windowId,
+           dismissed }                // per-item flag; group is auto-dismissed
+                                      //   when every item is dismissed
+       ]
+     }
+
+   Legacy individual entries have no `kind` field and are treated as
+   kind: 'tab' by the renderer.
+   ---------------------------------------------------------------- */
+
+/**
+ * saveGroupForLater(group, { directToArchive })
+ *
+ * Persists a whole domain group (all tabs + per-tab restore metadata)
+ * as a single grouped entry in chrome.storage.local.
+ */
+async function saveGroupForLater(group, options = {}) {
+  const { directToArchive = false, baseId = Date.now().toString() } = options;
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const now = new Date().toISOString();
+  const label  = group.label || friendlyDomain(group.domain);
+
+  deferred.push({
+    id:          baseId,
+    kind:        'group',
+    label,
+    domain:      group.domain,
+    savedAt:     now,
+    completed:   !!directToArchive,
+    completedAt: directToArchive ? now : undefined,
+    dismissed:   false,
+    items: (group.tabs || []).map((t, i) => ({
+      id:            `${baseId}-${i}`,
+      url:           t.url,
+      title:         t.title,
+      workspaceId:   t.workspaceId   || null,
+      workspaceName: t.workspaceName || null,
+      index:         (typeof t.index === 'number') ? t.index : null,
+      windowId:      t.windowId      || null,
+      dismissed:     false,
+    })),
+  });
+
+  await chrome.storage.local.set({ deferred });
+}
+
+/**
+ * dismissGroupItem(groupId, itemId)
+ *
+ * Removes a single tab from a saved group. If every tab in the group
+ * is now dismissed, the group itself is auto-dismissed too.
+ */
+async function dismissGroupItem(groupId, itemId) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const group = deferred.find(g => g.id === groupId && g.kind === 'group');
+  if (!group) return;
+  const item = group.items.find(i => i.id === itemId);
+  if (!item) return;
+  item.dismissed = true;
+  // Auto-dismiss the group when it's empty
+  if (group.items.every(i => i.dismissed)) group.dismissed = true;
+  await chrome.storage.local.set({ deferred });
+}
+
+/**
+ * checkOffGroup(groupId) — move a saved group to the archive.
+ */
+async function checkOffGroup(groupId) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const group = deferred.find(g => g.id === groupId && g.kind === 'group');
+  if (!group) return;
+  group.completed = true;
+  group.completedAt = new Date().toISOString();
+  await chrome.storage.local.set({ deferred });
+}
+
+/**
+ * dismissGroup(groupId) — permanently remove a saved group.
+ */
+async function dismissGroup(groupId) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const group = deferred.find(g => g.id === groupId && g.kind === 'group');
+  if (!group) return;
+  group.dismissed = true;
+  await chrome.storage.local.set({ deferred });
+}
+
+/**
+ * restoreArchivedGroup(groupId) — move an archived group back to active saved.
+ */
+async function restoreArchivedGroup(groupId) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const group = deferred.find(g => g.id === groupId && g.kind === 'group');
+  if (!group) return;
+  group.completed = false;
+  delete group.completedAt;
+  await chrome.storage.local.set({ deferred });
+}
+
+/**
+ * buildLiveWorkspaceMap()
+ *
+ * Derives a Map<workspaceId, currentWorkspaceName> from the live tab list.
+ * Used to (a) self-heal stored workspace names across renames, and (b) detect
+ * when a workspace has been deleted so we can flag it in the badge.
+ */
+function buildLiveWorkspaceMap() {
+  const map = new Map();
+  for (const t of openTabs) {
+    if (t.workspaceId && t.workspaceName && !map.has(t.workspaceId)) {
+      map.set(t.workspaceId, t.workspaceName);
+    }
+  }
+  return map;
+}
+
+/**
+ * migrateWorkspaceNames(deferred, storedIcons, liveWorkspaces)
+ *
+ * Walks every saved group's items. For any item whose workspaceId is still
+ * live but whose stored workspaceName differs, updates the name in-place and
+ * moves the user's emoji icon (if any) from the old name key to the new name
+ * key in the workspaceIcons map. Returns { itemsChanged, iconsChanged } so the
+ * caller can persist to chrome.storage.local only when something actually
+ * changed (avoids spurious writes on every render).
+ *
+ * Skipped entirely when liveWorkspaces is empty (tabs haven't loaded yet —
+ * mutating based on an empty map would falsely "delete" everything).
+ */
+function migrateWorkspaceNames(deferred, storedIcons, liveWorkspaces) {
+  if (!liveWorkspaces || liveWorkspaces.size === 0) {
+    return { itemsChanged: false, iconsChanged: false };
+  }
+
+  const renames = new Map();  // oldName -> newName
+  let itemsChanged = false;
+
+  for (const entry of deferred) {
+    if (entry.kind !== 'group' || !Array.isArray(entry.items)) continue;
+    for (const item of entry.items) {
+      if (!item.workspaceId) continue;
+      const live = liveWorkspaces.get(item.workspaceId);
+      if (!live) continue;                       // workspace deleted — leave name alone
+      if (item.workspaceName === live) continue; // no change
+      if (item.workspaceName) renames.set(item.workspaceName, live);
+      item.workspaceName = live;
+      itemsChanged = true;
+    }
+  }
+
+  let iconsChanged = false;
+  for (const [oldName, newName] of renames) {
+    if (storedIcons[oldName] && !storedIcons[newName]) {
+      storedIcons[newName] = storedIcons[oldName];
+      delete storedIcons[oldName];
+      iconsChanged = true;
+    }
+  }
+
+  return { itemsChanged, iconsChanged };
+}
+
+
+/* ----------------------------------------------------------------
+   WORKSPACE ICONS — chrome.storage.local
+
+   User-picked workspace emojis live under the 'workspaceIcons' key,
+   keyed by workspace NAME (not id, since ids can shift). The in-UI
+   picker (pencil on each workspace pill) is the only way to manage them.
+   ---------------------------------------------------------------- */
+
+async function getWorkspaceIconOverrides() {
+  const { workspaceIcons = {} } = await chrome.storage.local.get('workspaceIcons');
+  return workspaceIcons;
+}
+
+async function setWorkspaceIconOverride(name, icon) {
+  const overrides = await getWorkspaceIconOverrides();
+  if (icon) overrides[name] = icon;
+  else delete overrides[name];
+  await chrome.storage.local.set({ workspaceIcons: overrides });
 }
 
 
@@ -613,13 +840,9 @@ function capitalize(str) {
 
 function stripTitleNoise(title) {
   if (!title) return '';
-  // Strip leading notification count: "(2) Title"
+  // Strip leading notification count: "(2) Title" — that's a browser/page
+  // unread badge, not part of the actual page name.
   title = title.replace(/^\(\d+\+?\)\s*/, '');
-  // Strip inline counts like "Inbox (16,359)"
-  title = title.replace(/\s*\([\d,]+\+?\)\s*/g, ' ');
-  // Strip email addresses (privacy + cleaner display)
-  title = title.replace(/\s*[\-\u2010-\u2015]\s*[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '');
-  title = title.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '');
   // Clean X/Twitter format
   title = title.replace(/\s+on X:\s*/, ': ');
   title = title.replace(/\s*\/\s*X\s*$/, '');
@@ -708,6 +931,26 @@ const ICONS = {
    ---------------------------------------------------------------- */
 let domainGroups = [];
 
+// Opera GX workspace filter — null = "All", otherwise a workspaceId string
+let activeWorkspace = null;
+
+// Curated emoji library used by the workspace icon picker.
+// Grouped by category; the free-form input below accepts anything else.
+const EMOJI_CATEGORIES = [
+  { name: 'Work',    emojis: ['💼','📊','📈','📉','💻','🖥️','⌨️','🖨️','📱','📞','✉️','📧','📫','📎','📌','📍','🗂️','📁','📂','📋','📝','✏️','🖊️','📅','📆','🗓️','⏰','⏱️','🔖','💡'] },
+  { name: 'Money',   emojis: ['💰','💵','💳','💎','🏦','💹','🧾','🪙'] },
+  { name: 'Food',    emojis: ['🍳','🍽️','🍔','🍕','🥗','🍜','🍣','🍱','🥟','🍰','🎂','☕','🍵','🍷','🍺','🥤','🍎','🥐','🍪','🌮','🍿','🥞','🧇','🥙','🥘','🧃'] },
+  { name: 'Nature',  emojis: ['🌿','🌱','🌳','🌺','🌸','🌻','🌞','🌙','⭐','🌈','☀️','🔥','💧','🌊','🏔️','⛰️','🏝️','🏖️','🌍','🌵','🍄'] },
+  { name: 'Travel',  emojis: ['✈️','🚗','🚕','🚂','🚢','⚓','🚀','🏍️','🚲','🛫','🗺️','🏨','🛣️'] },
+  { name: 'Home',    emojis: ['🏠','🏡','🛋️','🛏️','🚪','🧹','🧺','📦','🎁','🔑','🔒','🔨','🛠️','🔧','⚙️','🧰','🧲','🧼','🪑'] },
+  { name: 'Play',    emojis: ['🎮','🎨','🎵','🎸','🎹','🎧','📷','🎬','📚','📖','🎯','🎲','🧩','🪁','🎭','🎪','🕹️','🎤'] },
+  { name: 'Sport',   emojis: ['🧘','🏃','🚴','🏊','⚽','🏀','🏈','🏐','🎾','🏓','🥊','🥋','🏆','🥇','🏅','⛷️','🏂','🏋️','🤸'] },
+  { name: 'Animals', emojis: ['🐶','🐱','🐭','🐰','🦊','🐻','🐼','🐨','🐯','🦁','🐷','🐸','🐵','🐔','🦆','🐦','🐧','🐢','🐟','🐳','🦋','🐝','🐙','🦉','🦖'] },
+  { name: 'People',  emojis: ['👤','👥','🧠','👁️','👋','👍','👎','✌️','🤝','💪','🫶','🧑‍💻','🧑‍🍳','🧑‍🎨','🧑‍🔬','🧑‍🏫','🧑‍⚕️','🧑‍🔧','🧑‍💼','🧑‍🌾'] },
+  { name: 'Heart',   emojis: ['❤️','🧡','💛','💚','💙','💜','🖤','🤍','🤎','💖','💗','💘','💝','💓','💔'] },
+  { name: 'Symbol',  emojis: ['✨','💫','⭐','🌟','💥','🔥','⚡','💯','✅','🎉','🎊','❓','❗','💬','🔔','🔕','🎫','🏷️','🔱','♾️','🚧','⚠️','☑️','🆕','🆗','🆒','🔸','🔹','🟢','🟡','🔴','🟣','🟠','⚫','⚪'] },
+];
+
 
 /* ----------------------------------------------------------------
    HELPER: filter out browser-internal pages
@@ -759,7 +1002,9 @@ function checkTabOutDupes() {
 
 function buildOverflowChips(hiddenTabs, urlCounts = {}) {
   const hiddenChips = hiddenTabs.map(tab => {
-    const label    = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
+    let tabHostname = '';
+    try { tabHostname = new URL(tab.url).hostname; } catch {}
+    const label    = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), tabHostname);
     const count    = urlCounts[tab.url] || 1;
     const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
     const chipClass = count > 1 ? ' chip-has-dupes' : '';
@@ -769,7 +1014,7 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
     try { domain = new URL(tab.url).hostname; } catch {}
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
     return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
-      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
+      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="">` : ''}
       <span class="chip-text">${label}</span>${dupeTag}
       <div class="chip-actions">
         <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
@@ -803,7 +1048,6 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
 function renderDomainCard(group) {
   const tabs      = group.tabs || [];
   const tabCount  = tabs.length;
-  const isLanding = group.domain === '__landing-pages__';
   const stableId  = 'domain-' + group.domain.replace(/[^a-z0-9]/g, '-');
 
   // Count duplicates (exact URL match)
@@ -835,7 +1079,11 @@ function renderDomainCard(group) {
   const extraCount  = uniqueTabs.length - visibleTabs.length;
 
   const pageChips = visibleTabs.map(tab => {
-    let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), group.domain);
+    // Prefer the tab's own hostname for trailing-site-name stripping
+    // (e.g. custom groups use a synthetic key as group.domain).
+    let chipHostname = group.domain;
+    try { chipHostname = new URL(tab.url).hostname; } catch {}
+    let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), chipHostname);
     // For localhost tabs, prepend port number so you can tell projects apart
     try {
       const parsed = new URL(tab.url);
@@ -850,7 +1098,7 @@ function renderDomainCard(group) {
     try { domain = new URL(tab.url).hostname; } catch {}
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
     return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
-      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
+      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="">` : ''}
       <span class="chip-text">${label}</span>${dupeTag}
       <div class="chip-actions">
         <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
@@ -863,7 +1111,17 @@ function renderDomainCard(group) {
     </div>`;
   }).join('') + (extraCount > 0 ? buildOverflowChips(uniqueTabs.slice(8), urlCounts) : '');
 
+  const saveIconSvg = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>`;
+
   let actionsHtml = `
+    <button class="action-btn save-tabs" data-action="save-domain-group" data-domain-id="${stableId}" title="Save all tabs to Saved for Later">
+      ${saveIconSvg}
+      Save
+    </button>
+    <button class="action-btn" data-action="archive-domain-group" data-domain-id="${stableId}" title="Archive all tabs (skip the checklist)">
+      ${ICONS.archive}
+      Archive
+    </button>
     <button class="action-btn close-tabs" data-action="close-domain-tabs" data-domain-id="${stableId}">
       ${ICONS.close}
       Close all ${tabCount} tab${tabCount !== 1 ? 's' : ''}
@@ -882,7 +1140,7 @@ function renderDomainCard(group) {
       <div class="status-bar"></div>
       <div class="mission-content">
         <div class="mission-top">
-          <span class="mission-name">${isLanding ? 'Homepages' : (group.label || friendlyDomain(group.domain))}</span>
+          <span class="mission-name">${group.label || friendlyDomain(group.domain)}</span>
           ${tabBadge}
           ${dupeBadge}
         </div>
@@ -920,7 +1178,23 @@ async function renderDeferredColumn() {
   if (!column) return;
 
   try {
-    const { active, archived } = await getSavedTabs();
+    // Read the raw deferred list so we can mutate + persist migrations.
+    const { deferred = [] } = await chrome.storage.local.get('deferred');
+    const storedIcons    = await getWorkspaceIconOverrides();
+    const liveWorkspaces = buildLiveWorkspaceMap();
+
+    // Self-heal: if a workspace was renamed, update every saved group's
+    // stored name and migrate the emoji icon key. Writes back only when
+    // something actually changed.
+    const { itemsChanged, iconsChanged } =
+      migrateWorkspaceNames(deferred, storedIcons, liveWorkspaces);
+    if (itemsChanged) await chrome.storage.local.set({ deferred });
+    if (iconsChanged) await chrome.storage.local.set({ workspaceIcons: storedIcons });
+
+    // Derive visible subsets AFTER migration so render sees fresh names.
+    const visible  = deferred.filter(t => !t.dismissed);
+    const active   = visible.filter(t => !t.completed);
+    const archived = visible.filter(t => t.completed);
 
     // Hide the entire column if there's nothing to show
     if (active.length === 0 && archived.length === 0) {
@@ -930,10 +1204,14 @@ async function renderDeferredColumn() {
 
     column.style.display = 'block';
 
-    // Render active checklist items
+    // Render active checklist items (mix of individual tabs and saved groups)
     if (active.length > 0) {
       countEl.textContent = `${active.length} item${active.length !== 1 ? 's' : ''}`;
-      list.innerHTML = active.map(item => renderDeferredItem(item)).join('');
+      list.innerHTML = active
+        .map(item => item.kind === 'group'
+          ? renderDeferredGroup(item, storedIcons, liveWorkspaces)
+          : renderDeferredItem(item))
+        .join('');
       list.style.display = 'block';
       empty.style.display = 'none';
     } else {
@@ -942,10 +1220,14 @@ async function renderDeferredColumn() {
       empty.style.display = 'block';
     }
 
-    // Render archive section
+    // Render archive section (mix of individual tabs and archived groups)
     if (archived.length > 0) {
       archiveCountEl.textContent = `(${archived.length})`;
-      archiveList.innerHTML = archived.map(item => renderArchiveItem(item)).join('');
+      archiveList.innerHTML = archived
+        .map(item => item.kind === 'group'
+          ? renderArchiveGroup(item, storedIcons, liveWorkspaces)
+          : renderArchiveItem(item))
+        .join('');
       archiveEl.style.display = 'block';
     } else {
       archiveEl.style.display = 'none';
@@ -974,13 +1256,16 @@ function renderDeferredItem(item) {
       <input type="checkbox" class="deferred-checkbox" data-action="check-deferred" data-deferred-id="${item.id}">
       <div class="deferred-info">
         <a href="${item.url}" target="_blank" rel="noopener" class="deferred-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
-          <img src="${faviconUrl}" alt="" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px" onerror="this.style.display='none'">${item.title || item.url}
+          <img src="${faviconUrl}" alt="" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px">${item.title || item.url}
         </a>
         <div class="deferred-meta">
           <span>${domain}</span>
           <span>${ago}</span>
         </div>
       </div>
+      <button class="deferred-restore" data-action="restore-deferred" data-deferred-id="${item.id}" title="Reopen as a tab">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 19.5 15-15m0 0H8.25m11.25 0v11.25" /></svg>
+      </button>
       <button class="deferred-dismiss" data-action="dismiss-deferred" data-deferred-id="${item.id}" title="Dismiss">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
       </button>
@@ -995,11 +1280,204 @@ function renderDeferredItem(item) {
 function renderArchiveItem(item) {
   const ago = item.completedAt ? timeAgo(item.completedAt) : timeAgo(item.savedAt);
   return `
-    <div class="archive-item">
+    <div class="archive-item" data-deferred-id="${item.id}">
       <a href="${item.url}" target="_blank" rel="noopener" class="archive-item-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
         ${item.title || item.url}
       </a>
       <span class="archive-item-date">${ago}</span>
+      <button class="archive-restore" data-action="restore-archived" data-deferred-id="${item.id}" title="Restore to Saved for Later">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 15 3 9m0 0 6-6M3 9h12a6 6 0 0 1 0 12h-3" /></svg>
+      </button>
+    </div>`;
+}
+
+/**
+ * buildGroupWorkspaceBadge(group, storedIcons, liveWorkspaces)
+ *
+ * Inspects the group's non-dismissed items to figure out which Opera GX
+ * workspaces they came from. Returns an HTML fragment for the header's meta
+ * line.
+ *
+ *   - single workspace  → "<icon> Name"
+ *   - deleted workspace → "Name (deleted)" with muted style (requires
+ *                         liveWorkspaces to be populated — otherwise we
+ *                         assume the live map is just unavailable and fall
+ *                         back to the stored name as-is)
+ *   - multiple          → "Name + OtherName"  (icons omitted to save space)
+ *   - no workspace info → "" (caller falls back to just the time)
+ */
+function buildGroupWorkspaceBadge(group, storedIcons = {}, liveWorkspaces = new Map()) {
+  const escape = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const liveKnown = liveWorkspaces && liveWorkspaces.size > 0;
+
+  // workspaceId -> { name, isDeleted }
+  const seen = new Map();
+  for (const item of (group.items || [])) {
+    if (item.dismissed) continue;
+    if (!item.workspaceId) continue;
+    if (seen.has(item.workspaceId)) continue;
+    const live = liveWorkspaces.get(item.workspaceId);
+    if (live) {
+      seen.set(item.workspaceId, { name: live, isDeleted: false });
+    } else if (item.workspaceName) {
+      // Only flag as deleted when we're confident the live map is authoritative.
+      seen.set(item.workspaceId, { name: item.workspaceName, isDeleted: liveKnown });
+    }
+  }
+  if (seen.size === 0) return '';
+
+  const entries = [...seen.values()];
+  if (entries.length === 1) {
+    const { name, isDeleted } = entries[0];
+    const icon = isDeleted ? null : storedIcons[name];
+    const iconHtml = icon ? `<span class="group-ws-icon">${escape(icon)}</span>` : '';
+    const cls   = isDeleted ? 'group-ws-badge deleted' : 'group-ws-badge';
+    const label = isDeleted ? `${escape(name)} (deleted)` : escape(name);
+    const title = isDeleted ? `Workspace deleted: ${name}` : `Workspace: ${name}`;
+    return `<span class="${cls}" title="${escape(title)}">${iconHtml}${label}</span>`;
+  }
+
+  // 2+ workspaces (only possible for legacy saves from before split-by-workspace).
+  const joined  = entries.map(e => e.isDeleted ? `${escape(e.name)} (deleted)` : escape(e.name)).join(' + ');
+  const tipText = entries.map(e => e.isDeleted ? `${e.name} (deleted)` : e.name).join(', ');
+  return `<span class="group-ws-badge multi" title="Workspaces: ${escape(tipText)}">${joined}</span>`;
+}
+
+/**
+ * renderDeferredGroup(group, storedIcons)
+ *
+ * Builds HTML for a saved GROUP (many tabs) in the active "Saved for Later"
+ * column. Header shows favicon + domain label + item count and three header
+ * actions (restore all, check-off-to-archive, dismiss). Body lists each
+ * non-dismissed tab with per-item restore + dismiss buttons. Collapsible.
+ */
+function renderDeferredGroup(group, storedIcons = {}, liveWorkspaces = new Map()) {
+  const visibleItems = (group.items || []).filter(i => !i.dismissed);
+  const count = visibleItems.length;
+  const ago = timeAgo(group.savedAt);
+  const faviconUrl = group.domain
+    ? `https://www.google.com/s2/favicons?domain=${group.domain}&sz=16`
+    : '';
+  const safeLabel = (group.label || 'Group').replace(/"/g, '&quot;');
+  const wsBadge = buildGroupWorkspaceBadge(group, storedIcons, liveWorkspaces);
+  const metaHtml = wsBadge ? `${wsBadge} <span class="group-meta-dot">·</span> ${ago}` : ago;
+
+  const itemsHtml = visibleItems.map(item => {
+    const safeTitle = (item.title || item.url || '').replace(/"/g, '&quot;');
+    let itemDomain = '';
+    try { itemDomain = new URL(item.url).hostname.replace(/^www\./, ''); } catch {}
+    const itemFavicon = itemDomain
+      ? `https://www.google.com/s2/favicons?domain=${itemDomain}&sz=16`
+      : '';
+    return `
+      <div class="group-item" data-group-id="${group.id}" data-item-id="${item.id}">
+        <a href="${item.url}" target="_blank" rel="noopener" class="group-item-title" title="${safeTitle}">
+          ${itemFavicon ? `<img src="${itemFavicon}" alt="" class="group-item-favicon">` : ''}
+          <span class="group-item-text">${item.title || item.url}</span>
+        </a>
+        <button class="deferred-restore" data-action="restore-group-item" data-group-id="${group.id}" data-item-id="${item.id}" title="Reopen as a tab">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 19.5 15-15m0 0H8.25m11.25 0v11.25" /></svg>
+        </button>
+        <button class="deferred-dismiss" data-action="dismiss-group-item" data-group-id="${group.id}" data-item-id="${item.id}" title="Dismiss">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+        </button>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="deferred-group" data-group-id="${group.id}">
+      <div class="group-header">
+        <button class="group-toggle" data-action="toggle-group" data-group-id="${group.id}" title="Expand/collapse">
+          <svg class="group-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>
+        </button>
+        <div class="group-header-info">
+          <div class="group-header-title" title="${safeLabel}">
+            ${faviconUrl ? `<img src="${faviconUrl}" alt="" class="group-header-favicon">` : ''}
+            <span class="group-header-label">${group.label || 'Group'}</span>
+            <span class="group-header-count">${count} tab${count !== 1 ? 's' : ''}</span>
+          </div>
+          <div class="group-header-meta">${metaHtml}</div>
+        </div>
+        <button class="group-header-action" data-action="restore-group-all" data-group-id="${group.id}" title="Reopen all tabs">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 19.5 15-15m0 0H8.25m11.25 0v11.25" /></svg>
+        </button>
+        <button class="group-header-action group-check" data-action="check-group" data-group-id="${group.id}" title="Archive this group">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M20.25 7.5l-.625 10.632a2.25 2.25 0 0 1-2.247 2.118H6.622a2.25 2.25 0 0 1-2.247-2.118L3.75 7.5" /><path stroke-linecap="round" stroke-linejoin="round" d="M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125Z" /></svg>
+        </button>
+        <button class="group-header-action" data-action="dismiss-group" data-group-id="${group.id}" title="Dismiss (delete)">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+      <div class="group-body">${itemsHtml}</div>
+    </div>`;
+}
+
+/**
+ * renderArchiveGroup(group)
+ *
+ * Builds HTML for a saved group that's been archived. Header has
+ * "Restore all" (opens every tab and dismisses the archive entry) and
+ * "Move back to saved". Body has per-item restore + dismiss, identical
+ * to the active group body.
+ */
+function renderArchiveGroup(group, storedIcons = {}, liveWorkspaces = new Map()) {
+  const visibleItems = (group.items || []).filter(i => !i.dismissed);
+  const count = visibleItems.length;
+  const ago = group.completedAt ? timeAgo(group.completedAt) : timeAgo(group.savedAt);
+  const faviconUrl = group.domain
+    ? `https://www.google.com/s2/favicons?domain=${group.domain}&sz=16`
+    : '';
+  const safeLabel = (group.label || 'Group').replace(/"/g, '&quot;');
+  const wsBadge = buildGroupWorkspaceBadge(group, storedIcons, liveWorkspaces);
+  const metaHtml = wsBadge ? `${wsBadge} <span class="group-meta-dot">·</span> ${ago}` : ago;
+
+  const itemsHtml = visibleItems.map(item => {
+    const safeTitle = (item.title || item.url || '').replace(/"/g, '&quot;');
+    let itemDomain = '';
+    try { itemDomain = new URL(item.url).hostname.replace(/^www\./, ''); } catch {}
+    const itemFavicon = itemDomain
+      ? `https://www.google.com/s2/favicons?domain=${itemDomain}&sz=16`
+      : '';
+    return `
+      <div class="group-item archived" data-group-id="${group.id}" data-item-id="${item.id}">
+        <a href="${item.url}" target="_blank" rel="noopener" class="group-item-title" title="${safeTitle}">
+          ${itemFavicon ? `<img src="${itemFavicon}" alt="" class="group-item-favicon">` : ''}
+          <span class="group-item-text">${item.title || item.url}</span>
+        </a>
+        <button class="deferred-restore" data-action="restore-group-item" data-group-id="${group.id}" data-item-id="${item.id}" title="Reopen as a tab">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 19.5 15-15m0 0H8.25m11.25 0v11.25" /></svg>
+        </button>
+        <button class="deferred-dismiss" data-action="dismiss-group-item" data-group-id="${group.id}" data-item-id="${item.id}" title="Dismiss">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+        </button>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="deferred-group archived" data-group-id="${group.id}">
+      <div class="group-header">
+        <button class="group-toggle" data-action="toggle-group" data-group-id="${group.id}" title="Expand/collapse">
+          <svg class="group-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>
+        </button>
+        <div class="group-header-info">
+          <div class="group-header-title" title="${safeLabel}">
+            ${faviconUrl ? `<img src="${faviconUrl}" alt="" class="group-header-favicon">` : ''}
+            <span class="group-header-label">${group.label || 'Group'}</span>
+            <span class="group-header-count">${count} tab${count !== 1 ? 's' : ''}</span>
+          </div>
+          <div class="group-header-meta">${metaHtml}</div>
+        </div>
+        <button class="group-header-action" data-action="restore-group-all" data-group-id="${group.id}" title="Reopen all tabs">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 19.5 15-15m0 0H8.25m11.25 0v11.25" /></svg>
+        </button>
+        <button class="group-header-action" data-action="restore-archived-group" data-group-id="${group.id}" title="Move back to Saved for Later">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 15 3 9m0 0 6-6M3 9h12a6 6 0 0 1 0 12h-3" /></svg>
+        </button>
+        <button class="group-header-action" data-action="dismiss-group" data-group-id="${group.id}" title="Dismiss (delete)">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+      <div class="group-body">${itemsHtml}</div>
     </div>`;
 }
 
@@ -1030,42 +1508,76 @@ async function renderStaticDashboard() {
   await fetchOpenTabs();
   const realTabs = getRealTabs();
 
-  // --- Group tabs by domain ---
-  // Landing pages (Gmail inbox, Twitter home, etc.) get their own special group
-  // so they can be closed together without affecting content tabs on the same domain.
-  const LANDING_PAGE_PATTERNS = [
-    { hostname: 'mail.google.com', test: (p, h) =>
-        !h.includes('#inbox/') && !h.includes('#sent/') && !h.includes('#search/') },
-    { hostname: 'x.com',               pathExact: ['/home'] },
-    { hostname: 'www.linkedin.com',    pathExact: ['/'] },
-    { hostname: 'github.com',          pathExact: ['/'] },
-    { hostname: 'www.youtube.com',     pathExact: ['/'] },
-    // Merge personal patterns from config.local.js (if it exists)
-    ...(typeof LOCAL_LANDING_PAGE_PATTERNS !== 'undefined' ? LOCAL_LANDING_PAGE_PATTERNS : []),
-  ];
+  // --- Opera GX workspace filter bar ---
+  // Workspace icons live entirely in chrome.storage.local, keyed by workspace
+  // name. They're managed via the in-UI emoji picker (the pencil on each pill).
+  const storedIcons = await getWorkspaceIconOverrides();
 
-  function isLandingPage(url) {
-    try {
-      const parsed = new URL(url);
-      return LANDING_PAGE_PATTERNS.some(p => {
-        // Support both exact hostname and suffix matching (for wildcard subdomains)
-        const hostnameMatch = p.hostname
-          ? parsed.hostname === p.hostname
-          : p.hostnameEndsWith
-            ? parsed.hostname.endsWith(p.hostnameEndsWith)
-            : false;
-        if (!hostnameMatch) return false;
-        if (p.test)       return p.test(parsed.pathname, url);
-        if (p.pathPrefix) return parsed.pathname.startsWith(p.pathPrefix);
-        if (p.pathExact)  return p.pathExact.includes(parsed.pathname);
-        return parsed.pathname === '/';
-      });
-    } catch { return false; }
+  // Collect unique workspaces and remember the smallest tab.index in each, so
+  // we can present them in Opera GX's natural sidebar order (workspaces own
+  // contiguous ranges of tab indices, so min index ≈ leftmost in the sidebar).
+  const workspaceMap = new Map();  // workspaceId -> { name, icon, minIndex }
+  for (const t of realTabs) {
+    if (!t.workspaceId) continue;
+    const name = t.workspaceName || 'Workspace';
+    const idx  = typeof t.index === 'number' ? t.index : Number.MAX_SAFE_INTEGER;
+    const existing = workspaceMap.get(t.workspaceId);
+    if (!existing) {
+      workspaceMap.set(t.workspaceId, { name, icon: storedIcons[name] || null, minIndex: idx });
+    } else if (idx < existing.minIndex) {
+      existing.minIndex = idx;
+    }
+  }
+  // Sort entries by minIndex ascending — leftmost workspace first.
+  const sortedWorkspaces = [...workspaceMap.entries()].sort(
+    (a, b) => a[1].minIndex - b[1].minIndex
+  );
+  // Reset filter if the active workspace no longer exists (deleted / all tabs closed).
+  if (activeWorkspace && !workspaceMap.has(activeWorkspace)) {
+    activeWorkspace = null;
+  }
+  // Render the filter bar only when there are ≥2 workspaces. Non-Opera browsers
+  // return undefined workspaceId, so the Map stays empty and the bar stays hidden.
+  const filterEl = document.getElementById('workspaceFilter');
+  if (filterEl) {
+    if (workspaceMap.size >= 2) {
+      const escape = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      const iconHtml = (icon) => {
+        if (!icon) return '';
+        const str = String(icon);
+        // If it looks like an image URL, render as <img>; otherwise treat as emoji/text.
+        if (/^(https?:|data:|chrome-extension:|\/)/i.test(str)) {
+          return `<img class="workspace-btn-icon" src="${escape(str)}" alt="">`;
+        }
+        return `<span class="workspace-btn-icon">${escape(str)}</span>`;
+      };
+      const allActive = activeWorkspace === null ? ' active' : '';
+      const allBtn = `<button class="workspace-btn${allActive}" data-action="filter-workspace">All</button>`;
+      const pencilSvg = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Zm0 0L19.5 7.125" /></svg>`;
+      const wsBtns = sortedWorkspaces.map(([id, ws]) => {
+        const activeCls = activeWorkspace === id ? ' active' : '';
+        return `<span class="workspace-btn-wrap">
+          <button class="workspace-btn${activeCls}" data-action="filter-workspace" data-workspace-id="${escape(id)}">${iconHtml(ws.icon)}${escape(ws.name)}</button>
+          <button class="workspace-btn-edit" data-action="open-icon-picker" data-workspace-name="${escape(ws.name)}" title="Change icon">${pencilSvg}</button>
+        </span>`;
+      }).join('');
+      filterEl.innerHTML = allBtn + wsBtns;
+      filterEl.style.display = 'flex';
+    } else {
+      filterEl.style.display = 'none';
+      filterEl.innerHTML = '';
+    }
   }
 
+  // Apply the workspace filter before grouping — landing-page extraction,
+  // custom groups, and domain grouping all flow from filteredTabs.
+  const filteredTabs = activeWorkspace
+    ? realTabs.filter(t => t.workspaceId === activeWorkspace)
+    : realTabs;
+
+  // --- Group tabs by domain ---
   domainGroups = [];
-  const groupMap    = {};
-  const landingTabs = [];
+  const groupMap = {};
 
   // Custom group rules from config.local.js (if any)
   const customGroups = typeof LOCAL_CUSTOM_GROUPS !== 'undefined' ? LOCAL_CUSTOM_GROUPS : [];
@@ -1087,13 +1599,8 @@ async function renderStaticDashboard() {
     } catch { return null; }
   }
 
-  for (const tab of realTabs) {
+  for (const tab of filteredTabs) {
     try {
-      if (isLandingPage(tab.url)) {
-        landingTabs.push(tab);
-        continue;
-      }
-
       // Check custom group rules first (e.g. merge subdomains, split by path)
       const customRule = matchCustomGroup(tab.url);
       if (customRule) {
@@ -1118,29 +1625,8 @@ async function renderStaticDashboard() {
     }
   }
 
-  if (landingTabs.length > 0) {
-    groupMap['__landing-pages__'] = { domain: '__landing-pages__', tabs: landingTabs };
-  }
-
-  // Sort: landing pages first, then domains from landing page sites, then by tab count
-  // Collect exact hostnames and suffix patterns for priority sorting
-  const landingHostnames = new Set(LANDING_PAGE_PATTERNS.map(p => p.hostname).filter(Boolean));
-  const landingSuffixes = LANDING_PAGE_PATTERNS.map(p => p.hostnameEndsWith).filter(Boolean);
-  function isLandingDomain(domain) {
-    if (landingHostnames.has(domain)) return true;
-    return landingSuffixes.some(s => domain.endsWith(s));
-  }
-  domainGroups = Object.values(groupMap).sort((a, b) => {
-    const aIsLanding = a.domain === '__landing-pages__';
-    const bIsLanding = b.domain === '__landing-pages__';
-    if (aIsLanding !== bIsLanding) return aIsLanding ? -1 : 1;
-
-    const aIsPriority = isLandingDomain(a.domain);
-    const bIsPriority = isLandingDomain(b.domain);
-    if (aIsPriority !== bIsPriority) return aIsPriority ? -1 : 1;
-
-    return b.tabs.length - a.tabs.length;
-  });
+  // Sort by tab count descending — busiest domain first
+  domainGroups = Object.values(groupMap).sort((a, b) => b.tabs.length - a.tabs.length);
 
   // --- Render domain cards ---
   const openTabsSection      = document.getElementById('openTabsSection');
@@ -1150,16 +1636,15 @@ async function renderStaticDashboard() {
 
   if (domainGroups.length > 0 && openTabsSection) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = 'Open tabs';
-    openTabsSectionCount.innerHTML = `${domainGroups.length} domain${domainGroups.length !== 1 ? 's' : ''} &nbsp;&middot;&nbsp; <button class="action-btn close-tabs" data-action="close-all-open-tabs" style="font-size:11px;padding:3px 10px;">${ICONS.close} Close all ${realTabs.length} tabs</button>`;
+    const dCount = domainGroups.length;
+    const tCount = filteredTabs.length;
+    openTabsSectionCount.textContent =
+      `${dCount} domain${dCount !== 1 ? 's' : ''} · ${tCount} tab${tCount !== 1 ? 's' : ''}`;
     openTabsMissionsEl.innerHTML = domainGroups.map(g => renderDomainCard(g)).join('');
     openTabsSection.style.display = 'block';
   } else if (openTabsSection) {
     openTabsSection.style.display = 'none';
   }
-
-  // --- Footer stats ---
-  const statTabs = document.getElementById('statTabs');
-  if (statTabs) statTabs.textContent = openTabs.length;
 
   // --- Check for duplicate Tab Out tabs ---
   checkTabOutDupes();
@@ -1188,6 +1673,56 @@ document.addEventListener('click', async (e) => {
 
   const action = actionEl.dataset.action;
 
+  // ---- Filter by Opera GX workspace ----
+  if (action === 'filter-workspace') {
+    const wsId = actionEl.dataset.workspaceId || null;
+    if (activeWorkspace === wsId) return;  // already active — no work to do
+    activeWorkspace = wsId;
+    await renderStaticDashboard();
+    return;
+  }
+
+  // ---- Open the workspace icon picker ----
+  if (action === 'open-icon-picker') {
+    e.stopPropagation();
+    const name = actionEl.dataset.workspaceName;
+    if (!name) return;
+    openIconPicker(actionEl, name);
+    return;
+  }
+
+  // ---- Pick an icon from the grid ----
+  if (action === 'pick-icon') {
+    e.stopPropagation();
+    const picker = document.getElementById('iconPicker');
+    const name = picker && picker.dataset.workspaceName;
+    const icon = actionEl.dataset.icon;
+    if (!name || !icon) return;
+    await setWorkspaceIconOverride(name, icon);
+    closeIconPicker();
+    await renderStaticDashboard();
+    return;
+  }
+
+  // ---- Clear the current workspace's icon override ----
+  if (action === 'clear-icon') {
+    e.stopPropagation();
+    const picker = document.getElementById('iconPicker');
+    const name = picker && picker.dataset.workspaceName;
+    if (!name) return;
+    await setWorkspaceIconOverride(name, null);
+    closeIconPicker();
+    await renderStaticDashboard();
+    return;
+  }
+
+  // ---- Close the picker via its X ----
+  if (action === 'close-icon-picker') {
+    e.stopPropagation();
+    closeIconPicker();
+    return;
+  }
+
   // ---- Close duplicate Tab Out tabs ----
   if (action === 'close-tabout-dupes') {
     await closeTabOutDupes();
@@ -1206,7 +1741,9 @@ document.addEventListener('click', async (e) => {
 
   // ---- Expand overflow chips ("+N more") ----
   if (action === 'expand-chips') {
-    const overflowContainer = actionEl.parentElement.querySelector('.page-chips-overflow');
+    const parent = actionEl.parentElement;
+    if (!parent) return;
+    const overflowContainer = parent.querySelector('.page-chips-overflow');
     if (overflowContainer) {
       overflowContainer.style.display = 'contents';
       actionEl.remove();
@@ -1256,10 +1793,7 @@ document.addEventListener('click', async (e) => {
       }, 200);
     }
 
-    // Update footer
-    const statTabs = document.getElementById('statTabs');
-    if (statTabs) statTabs.textContent = openTabs.length;
-
+    // The chrome.tabs.onRemoved listener will auto-refresh the section count.
     showToast('Tab closed');
     return;
   }
@@ -1271,9 +1805,19 @@ document.addEventListener('click', async (e) => {
     const tabTitle = actionEl.dataset.tabTitle || tabUrl;
     if (!tabUrl) return;
 
+    // Find the source tab so we can remember its Opera GX workspace + position
+    const sourceTab = openTabs.find(t => t.url === tabUrl);
+
     // Save to chrome.storage.local
     try {
-      await saveTabForLater({ url: tabUrl, title: tabTitle });
+      await saveTabForLater({
+        url:           tabUrl,
+        title:         tabTitle,
+        workspaceId:   sourceTab && sourceTab.workspaceId,
+        workspaceName: sourceTab && sourceTab.workspaceName,
+        index:         sourceTab && sourceTab.index,
+        windowId:      sourceTab && sourceTab.windowId,
+      });
     } catch (err) {
       console.error('[tab-out] Failed to save tab:', err);
       showToast('Failed to save tab');
@@ -1340,6 +1884,355 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
+  // ---- Restore a saved-for-later tab back to the browser ----
+  if (action === 'restore-deferred') {
+    e.stopPropagation();
+    const id = actionEl.dataset.deferredId;
+    if (!id) return;
+
+    // Pull the full record from storage so we get url + workspace + position together
+    const { deferred = [] } = await chrome.storage.local.get('deferred');
+    const stored = deferred.find(t => t.id === id);
+    if (!stored || !stored.url) return;
+
+    // Build create options. Only include each field if we know it — undefined
+    // would shadow Chrome's defaults.
+    const createOpts = { url: stored.url, active: false };
+    if (stored.workspaceId != null) createOpts.workspaceId = stored.workspaceId;
+    if (stored.windowId    != null) createOpts.windowId    = stored.windowId;
+    if (stored.index       != null) createOpts.index       = stored.index;
+
+    let createdTab;
+    try {
+      createdTab = await chrome.tabs.create(createOpts);
+    } catch (err) {
+      // windowId may have closed since save — retry without it
+      if (createOpts.windowId != null) {
+        try {
+          delete createOpts.windowId;
+          createdTab = await chrome.tabs.create(createOpts);
+        } catch (err2) {
+          console.error('[tab-out] Failed to reopen tab:', err2);
+          showToast('Could not reopen tab');
+          return;
+        }
+      } else {
+        console.error('[tab-out] Failed to reopen tab:', err);
+        showToast('Could not reopen tab');
+        return;
+      }
+    }
+
+    // If a workspace was requested but didn't stick at creation, patch it on.
+    // Some Opera GX builds need workspaceId via tabs.update rather than create.
+    if (stored.workspaceId != null && createdTab && createdTab.workspaceId !== stored.workspaceId) {
+      try {
+        await chrome.tabs.update(createdTab.id, { workspaceId: stored.workspaceId });
+      } catch {
+        // Older Opera GX may not support workspaceId on update — tab still opens.
+      }
+    }
+
+    // Now that the tab is open, remove it from the saved-for-later list
+    await dismissSavedTab(id);
+
+    const item = actionEl.closest('.deferred-item');
+    if (item) {
+      item.classList.add('removing');
+      setTimeout(() => {
+        item.remove();
+        renderDeferredColumn();
+        renderStaticDashboard();
+      }, 300);
+    } else {
+      await renderStaticDashboard();
+    }
+
+    showToast('Reopened as a tab');
+    return;
+  }
+
+  // ---- Save the whole domain group for later (active checklist) ----
+  if (action === 'save-domain-group' || action === 'archive-domain-group') {
+    const directToArchive = action === 'archive-domain-group';
+    const domainId = actionEl.dataset.domainId;
+    const group    = domainGroups.find(g =>
+      'domain-' + g.domain.replace(/[^a-z0-9]/g, '-') === domainId
+    );
+    if (!group) return;
+
+    // Split tabs by Opera GX workspaceId so each workspace becomes its OWN
+    // saved group — makes it obvious which domain tabs came from which
+    // workspace when reviewing later. Tabs with no workspaceId (e.g. non-Opera)
+    // share a single bucket.
+    const buckets = new Map();
+    for (const tab of (group.tabs || [])) {
+      const key = tab.workspaceId != null ? tab.workspaceId : '__none__';
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(tab);
+    }
+    // Preserve Opera GX sidebar ordering — bucket with the smallest tab
+    // index ends up first in the saved list.
+    const bucketLists = [...buckets.values()].sort((a, b) => {
+      const ai = Math.min(...a.map(t => (typeof t.index === 'number') ? t.index : Infinity));
+      const bi = Math.min(...b.map(t => (typeof t.index === 'number') ? t.index : Infinity));
+      return ai - bi;
+    });
+
+    // Persist each bucket as its own group so renderDeferredGroup later
+    // shows one card per workspace with a clean single-workspace badge.
+    const saveStart = Date.now();
+    try {
+      for (let i = 0; i < bucketLists.length; i++) {
+        await saveGroupForLater(
+          { ...group, tabs: bucketLists[i] },
+          { directToArchive, baseId: `${saveStart}-${i}` }
+        );
+      }
+    } catch (err) {
+      console.error('[tab-out] Failed to save group:', err);
+      showToast('Failed to save group');
+      return;
+    }
+
+    // Close the browser tabs (reuse the same close rules as close-domain-tabs)
+    const urls     = group.tabs.map(t => t.url);
+    // Custom groups (label set) match exact URLs because their synthetic
+    // group key isn't a real hostname. Regular domain groups match by hostname.
+    const useExact = !!group.label;
+    if (useExact) await closeTabsExact(urls);
+    else          await closeTabsByUrls(urls);
+
+    if (card) {
+      playCloseSound();
+      animateCardOut(card);
+    }
+
+    // Remove from in-memory groups so the card doesn't resurrect on next render
+    const idx = domainGroups.indexOf(group);
+    if (idx !== -1) domainGroups.splice(idx, 1);
+
+    const noun = directToArchive ? 'Archived' : 'Saved';
+    const groupLabel = group.label || friendlyDomain(group.domain);
+    const suffix     = bucketLists.length > 1 ? ` across ${bucketLists.length} workspaces` : '';
+    showToast(`${noun} ${urls.length} tab${urls.length !== 1 ? 's' : ''} from ${groupLabel}${suffix}`);
+
+    await renderDeferredColumn();
+    return;
+  }
+
+  // ---- Toggle a saved group's expand/collapse state ----
+  if (action === 'toggle-group') {
+    const groupEl = actionEl.closest('.deferred-group');
+    if (groupEl) groupEl.classList.toggle('collapsed');
+    return;
+  }
+
+  // ---- Restore all tabs in a saved group (active OR archived) ----
+  if (action === 'restore-group-all') {
+    const groupId = actionEl.dataset.groupId;
+    if (!groupId) return;
+
+    const { deferred = [] } = await chrome.storage.local.get('deferred');
+    const group = deferred.find(g => g.id === groupId && g.kind === 'group');
+    if (!group) return;
+
+    const items = (group.items || []).filter(i => !i.dismissed);
+    if (items.length === 0) {
+      // Nothing left to restore — just dismiss the now-empty group
+      await dismissGroup(groupId);
+      await renderDeferredColumn();
+      return;
+    }
+
+    // Restore every tab in its original workspace / index / window (best-effort).
+    // Sort by index ascending so inserts land in a predictable order.
+    const sorted = [...items].sort((a, b) =>
+      (a.index ?? Number.MAX_SAFE_INTEGER) - (b.index ?? Number.MAX_SAFE_INTEGER)
+    );
+    for (const item of sorted) {
+      const createOpts = { url: item.url, active: false };
+      if (item.workspaceId != null) createOpts.workspaceId = item.workspaceId;
+      if (item.windowId    != null) createOpts.windowId    = item.windowId;
+      if (item.index       != null) createOpts.index       = item.index;
+      let created;
+      try {
+        created = await chrome.tabs.create(createOpts);
+      } catch {
+        // windowId may have closed — retry without it
+        if (createOpts.windowId != null) {
+          try {
+            delete createOpts.windowId;
+            created = await chrome.tabs.create(createOpts);
+          } catch (err2) {
+            console.error('[tab-out] Could not reopen', item.url, err2);
+            continue;
+          }
+        } else {
+          console.error('[tab-out] Could not reopen', item.url);
+          continue;
+        }
+      }
+      // Patch workspaceId if the create didn't honor it
+      if (item.workspaceId != null && created && created.workspaceId !== item.workspaceId) {
+        try { await chrome.tabs.update(created.id, { workspaceId: item.workspaceId }); }
+        catch {}
+      }
+    }
+
+    // All tabs are open — dismiss the saved group entirely
+    await dismissGroup(groupId);
+    showToast(`Reopened ${items.length} tab${items.length !== 1 ? 's' : ''}`);
+    await renderDeferredColumn();
+    await renderStaticDashboard();
+    return;
+  }
+
+  // ---- Restore one item from a saved group ----
+  if (action === 'restore-group-item') {
+    const groupId = actionEl.dataset.groupId;
+    const itemId  = actionEl.dataset.itemId;
+    if (!groupId || !itemId) return;
+
+    const { deferred = [] } = await chrome.storage.local.get('deferred');
+    const group = deferred.find(g => g.id === groupId && g.kind === 'group');
+    if (!group) return;
+    const item = group.items.find(i => i.id === itemId);
+    if (!item || item.dismissed) return;
+
+    const createOpts = { url: item.url, active: false };
+    if (item.workspaceId != null) createOpts.workspaceId = item.workspaceId;
+    if (item.windowId    != null) createOpts.windowId    = item.windowId;
+    if (item.index       != null) createOpts.index       = item.index;
+
+    let created;
+    try {
+      created = await chrome.tabs.create(createOpts);
+    } catch {
+      if (createOpts.windowId != null) {
+        try {
+          delete createOpts.windowId;
+          created = await chrome.tabs.create(createOpts);
+        } catch (err2) {
+          console.error('[tab-out] Could not reopen', item.url, err2);
+          showToast('Could not reopen tab');
+          return;
+        }
+      } else {
+        console.error('[tab-out] Could not reopen', item.url);
+        showToast('Could not reopen tab');
+        return;
+      }
+    }
+    if (item.workspaceId != null && created && created.workspaceId !== item.workspaceId) {
+      try { await chrome.tabs.update(created.id, { workspaceId: item.workspaceId }); }
+      catch {}
+    }
+
+    // Mark the item dismissed; auto-dismiss the group if it's now empty
+    await dismissGroupItem(groupId, itemId);
+
+    const itemRow = actionEl.closest('.group-item');
+    if (itemRow) {
+      itemRow.classList.add('removing');
+      setTimeout(() => {
+        itemRow.remove();
+        renderDeferredColumn();
+        renderStaticDashboard();
+      }, 250);
+    } else {
+      await renderDeferredColumn();
+      await renderStaticDashboard();
+    }
+
+    showToast('Reopened as a tab');
+    return;
+  }
+
+  // ---- Dismiss one item from a saved group (without opening it) ----
+  if (action === 'dismiss-group-item') {
+    const groupId = actionEl.dataset.groupId;
+    const itemId  = actionEl.dataset.itemId;
+    if (!groupId || !itemId) return;
+
+    await dismissGroupItem(groupId, itemId);
+
+    const itemRow = actionEl.closest('.group-item');
+    if (itemRow) {
+      itemRow.classList.add('removing');
+      setTimeout(() => {
+        itemRow.remove();
+        renderDeferredColumn();
+      }, 250);
+    } else {
+      await renderDeferredColumn();
+    }
+    return;
+  }
+
+  // ---- Check off a saved group (move to archive) ----
+  if (action === 'check-group') {
+    const groupId = actionEl.dataset.groupId;
+    if (!groupId) return;
+    await checkOffGroup(groupId);
+    showToast('Group archived');
+    await renderDeferredColumn();
+    return;
+  }
+
+  // ---- Dismiss an entire saved group (delete it) ----
+  if (action === 'dismiss-group') {
+    const groupId = actionEl.dataset.groupId;
+    if (!groupId) return;
+    await dismissGroup(groupId);
+
+    const groupEl = actionEl.closest('.deferred-group');
+    if (groupEl) {
+      groupEl.classList.add('removing');
+      setTimeout(() => {
+        groupEl.remove();
+        renderDeferredColumn();
+      }, 250);
+    } else {
+      await renderDeferredColumn();
+    }
+    return;
+  }
+
+  // ---- Move an archived group back to active Saved for Later ----
+  if (action === 'restore-archived-group') {
+    const groupId = actionEl.dataset.groupId;
+    if (!groupId) return;
+    await restoreArchivedGroup(groupId);
+    showToast('Restored to Saved for Later');
+    await renderDeferredColumn();
+    return;
+  }
+
+  // ---- Restore an archived tab back to active "Saved for Later" ----
+  if (action === 'restore-archived') {
+    const id = actionEl.dataset.deferredId;
+    if (!id) return;
+
+    await restoreArchivedTab(id);
+
+    const item = actionEl.closest('.archive-item');
+    if (item) {
+      item.style.transition = 'opacity 0.25s, transform 0.25s';
+      item.style.opacity    = '0';
+      item.style.transform  = 'translateX(-10px)';
+      setTimeout(() => {
+        item.remove();
+        renderDeferredColumn();
+      }, 250);
+    } else {
+      await renderDeferredColumn();
+    }
+
+    showToast('Restored to Saved for Later');
+    return;
+  }
+
   // ---- Close all tabs in a domain group ----
   if (action === 'close-domain-tabs') {
     const domainId = actionEl.dataset.domainId;
@@ -1348,10 +2241,10 @@ document.addEventListener('click', async (e) => {
     });
     if (!group) return;
 
-    const urls      = group.tabs.map(t => t.url);
-    // Landing pages and custom groups (whose domain key isn't a real hostname)
-    // must use exact URL matching to avoid closing unrelated tabs
-    const useExact  = group.domain === '__landing-pages__' || !!group.label;
+    const urls     = group.tabs.map(t => t.url);
+    // Custom groups (label set) use a synthetic key as group.domain so we
+    // have to match by exact URL. Regular domain groups match by hostname.
+    const useExact = !!group.label;
 
     if (useExact) {
       await closeTabsExact(urls);
@@ -1368,11 +2261,10 @@ document.addEventListener('click', async (e) => {
     const idx = domainGroups.indexOf(group);
     if (idx !== -1) domainGroups.splice(idx, 1);
 
-    const groupLabel = group.domain === '__landing-pages__' ? 'Homepages' : (group.label || friendlyDomain(group.domain));
+    const groupLabel = group.label || friendlyDomain(group.domain);
     showToast(`Closed ${urls.length} tab${urls.length !== 1 ? 's' : ''} from ${groupLabel}`);
 
-    const statTabs = document.getElementById('statTabs');
-    if (statTabs) statTabs.textContent = openTabs.length;
+    // The chrome.tabs.onRemoved listener will auto-refresh the section count.
     return;
   }
 
@@ -1412,25 +2304,6 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
-  // ---- Close ALL open tabs ----
-  if (action === 'close-all-open-tabs') {
-    const allUrls = openTabs
-      .filter(t => t.url && !t.url.startsWith('chrome') && !t.url.startsWith('about:'))
-      .map(t => t.url);
-    await closeTabsByUrls(allUrls);
-    playCloseSound();
-
-    document.querySelectorAll('#openTabsMissions .mission-card').forEach(c => {
-      shootConfetti(
-        c.getBoundingClientRect().left + c.offsetWidth / 2,
-        c.getBoundingClientRect().top  + c.offsetHeight / 2
-      );
-      animateCardOut(c);
-    });
-
-    showToast('All tabs closed. Fresh start.');
-    return;
-  }
 });
 
 // ---- Archive toggle — expand/collapse the archive section ----
@@ -1445,6 +2318,33 @@ document.addEventListener('click', (e) => {
   }
 });
 
+// ---- Icon picker: click-outside closes it, Escape closes it ----
+document.addEventListener('click', (e) => {
+  const picker = document.getElementById('iconPicker');
+  if (!picker || picker.style.display === 'none') return;
+  if (picker.contains(e.target)) return;                // click inside picker — fine
+  if (e.target.closest('[data-action="open-icon-picker"]')) return; // opening click — fine
+  closeIconPicker();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const picker = document.getElementById('iconPicker');
+  if (picker && picker.style.display !== 'none') closeIconPicker();
+});
+
+// ---- Icon picker: free-form input (accepts any emoji / paste / Win+.) ----
+document.addEventListener('change', async (e) => {
+  if (e.target.id !== 'iconPickerInput') return;
+  const picker = document.getElementById('iconPicker');
+  const name = picker && picker.dataset.workspaceName;
+  const value = (e.target.value || '').trim();
+  if (!name || !value) return;
+  await setWorkspaceIconOverride(name, value);
+  closeIconPicker();
+  await renderStaticDashboard();
+});
+
 // ---- Archive search — filter archived items as user types ----
 document.addEventListener('input', async (e) => {
   if (e.target.id !== 'archiveSearch') return;
@@ -1455,25 +2355,169 @@ document.addEventListener('input', async (e) => {
 
   try {
     const { archived } = await getSavedTabs();
+    const storedIcons    = await getWorkspaceIconOverrides();
+    const liveWorkspaces = buildLiveWorkspaceMap();
+    const renderEntry = (item) =>
+      item.kind === 'group'
+        ? renderArchiveGroup(item, storedIcons, liveWorkspaces)
+        : renderArchiveItem(item);
 
     if (q.length < 2) {
-      // Show all archived items
-      archiveList.innerHTML = archived.map(item => renderArchiveItem(item)).join('');
+      archiveList.innerHTML = archived.map(renderEntry).join('');
       return;
     }
 
-    // Filter by title or URL containing the query string
-    const results = archived.filter(item =>
-      (item.title || '').toLowerCase().includes(q) ||
-      (item.url  || '').toLowerCase().includes(q)
-    );
+    // Match individual tabs by title/url. Match groups by label OR by any
+    // non-dismissed item inside the group matching title/url.
+    const results = archived.filter(item => {
+      if (item.kind === 'group') {
+        if ((item.label || '').toLowerCase().includes(q)) return true;
+        return (item.items || []).some(i =>
+          !i.dismissed && (
+            (i.title || '').toLowerCase().includes(q) ||
+            (i.url   || '').toLowerCase().includes(q)
+          )
+        );
+      }
+      return (item.title || '').toLowerCase().includes(q) ||
+             (item.url   || '').toLowerCase().includes(q);
+    });
 
-    archiveList.innerHTML = results.map(item => renderArchiveItem(item)).join('')
+    archiveList.innerHTML = results.map(renderEntry).join('')
       || '<div style="font-size:12px;color:var(--muted);padding:8px 0">No results</div>';
   } catch (err) {
     console.warn('[tab-out] Archive search failed:', err);
   }
 });
+
+
+/* ----------------------------------------------------------------
+   WORKSPACE ICON PICKER — render + position + close
+
+   Popover anchored to the clicked workspace's edit pencil. Contents
+   are built from EMOJI_CATEGORIES plus a free-form input so any emoji
+   (e.g. from Windows' Win+. picker) can be used.
+   ---------------------------------------------------------------- */
+
+function openIconPicker(anchorEl, workspaceName) {
+  const picker = document.getElementById('iconPicker');
+  if (!picker || !anchorEl) return;
+
+  const escape = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const safeName = escape(workspaceName);
+
+  const categoriesHtml = EMOJI_CATEGORIES.map(cat => {
+    const options = cat.emojis.map(e =>
+      `<button class="icon-picker-option" data-action="pick-icon" data-icon="${escape(e)}" title="${escape(e)}">${escape(e)}</button>`
+    ).join('');
+    return `<div class="icon-picker-section">
+      <div class="icon-picker-section-label">${escape(cat.name)}</div>
+      <div class="icon-picker-grid">${options}</div>
+    </div>`;
+  }).join('');
+
+  picker.dataset.workspaceName = workspaceName;
+  picker.innerHTML = `
+    <div class="icon-picker-header">
+      <span>Pick an icon for <strong>${safeName}</strong></span>
+      <button class="icon-picker-close" data-action="close-icon-picker" title="Close">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+      </button>
+    </div>
+    <div class="icon-picker-body">${categoriesHtml}</div>
+    <div class="icon-picker-footer">
+      <input type="text" class="icon-picker-input" id="iconPickerInput" placeholder="Or paste / type any emoji (Win+. on Windows)" maxlength="8">
+      <button class="icon-picker-clear" data-action="clear-icon">Clear</button>
+    </div>
+  `;
+
+  // Show first so offsetWidth/Height are real, then position.
+  picker.style.display = 'block';
+  picker.style.visibility = 'hidden';
+
+  const anchorRect = anchorEl.getBoundingClientRect();
+  const pickerRect = picker.getBoundingClientRect();
+  const margin = 8;
+
+  let top = anchorRect.bottom + window.scrollY + 6;
+  let left = anchorRect.left + window.scrollX;
+
+  // Keep inside viewport horizontally
+  const maxLeft = window.scrollX + document.documentElement.clientWidth - pickerRect.width - margin;
+  if (left > maxLeft) left = maxLeft;
+  if (left < margin) left = margin;
+
+  // If it would overflow the bottom, flip above the anchor
+  const viewportBottom = window.scrollY + document.documentElement.clientHeight;
+  if (top + pickerRect.height + margin > viewportBottom) {
+    top = anchorRect.top + window.scrollY - pickerRect.height - 6;
+    if (top < window.scrollY + margin) top = window.scrollY + margin;
+  }
+
+  picker.style.top  = top + 'px';
+  picker.style.left = left + 'px';
+  picker.style.visibility = 'visible';
+
+  // Autofocus the free-form input so Win+. / paste works immediately
+  const input = document.getElementById('iconPickerInput');
+  if (input) input.focus();
+}
+
+function closeIconPicker() {
+  const picker = document.getElementById('iconPicker');
+  if (!picker) return;
+  picker.style.display = 'none';
+  picker.innerHTML = '';
+  delete picker.dataset.workspaceName;
+}
+
+
+/* ----------------------------------------------------------------
+   BROKEN-IMAGE FALLBACK
+
+   Extensions have strict CSP that disallows inline event handlers
+   like onerror="...", so we handle image-load failures globally.
+   `error` events don't bubble — use a capturing listener instead.
+   ---------------------------------------------------------------- */
+document.addEventListener('error', (e) => {
+  const el = e.target;
+  if (el && el.tagName === 'IMG') {
+    el.style.display = 'none';
+  }
+}, true);
+
+
+/* ----------------------------------------------------------------
+   LIVE TAB SYNC
+
+   Re-render the dashboard when tabs change OUTSIDE Tab Out (open / close /
+   move / navigate in another window). Debounced so a flurry of events
+   (e.g. closing many tabs at once) collapses to a single render.
+   ---------------------------------------------------------------- */
+
+let __renderDebounceTimer = null;
+function scheduleDashboardRefresh(delay = 400) {
+  if (__renderDebounceTimer) clearTimeout(__renderDebounceTimer);
+  __renderDebounceTimer = setTimeout(() => {
+    __renderDebounceTimer = null;
+    renderStaticDashboard();
+  }, delay);
+}
+
+if (typeof chrome !== 'undefined' && chrome.tabs) {
+  chrome.tabs.onCreated.addListener(() => scheduleDashboardRefresh());
+  chrome.tabs.onRemoved.addListener(() => scheduleDashboardRefresh());
+  chrome.tabs.onMoved.addListener(()   => scheduleDashboardRefresh());
+  chrome.tabs.onAttached.addListener(() => scheduleDashboardRefresh());
+  chrome.tabs.onDetached.addListener(() => scheduleDashboardRefresh());
+  // onUpdated fires for every loading-progress tick — only refresh on
+  // changes that actually affect what we display (URL, title, completion).
+  chrome.tabs.onUpdated.addListener((_id, changeInfo) => {
+    if (changeInfo.url || changeInfo.title || changeInfo.status === 'complete') {
+      scheduleDashboardRefresh();
+    }
+  });
+}
 
 
 /* ----------------------------------------------------------------
