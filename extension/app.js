@@ -1072,7 +1072,7 @@ function renderDomainCard(group) {
       ${saveIconSvg}
       Save
     </button>
-    <button class="action-btn" data-action="archive-domain-group" data-domain-id="${stableId}" title="Archive all tabs (skip the checklist)">
+    <button class="action-btn archive-tabs" data-action="archive-domain-group" data-domain-id="${stableId}" title="Archive all tabs (skip the checklist)">
       ${ICONS.archive}
       Archive
     </button>
@@ -1090,7 +1090,7 @@ function renderDomainCard(group) {
   }
 
   return `
-    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}">
+    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}" data-domain="${group.domain}">
       <div class="status-bar"></div>
       <div class="mission-content">
         <div class="mission-top">
@@ -1207,7 +1207,6 @@ function renderDeferredItem(item) {
 
   return `
     <div class="deferred-item" data-deferred-id="${item.id}">
-      <input type="checkbox" class="deferred-checkbox" data-action="check-deferred" data-deferred-id="${item.id}">
       <div class="deferred-info">
         <a href="${item.url}" target="_blank" rel="noopener" class="deferred-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
           <img src="${faviconUrl}" alt="" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px">${item.title || item.url}
@@ -1451,6 +1450,79 @@ function renderArchiveGroup(group, storedIcons = {}, liveWorkspaces = new Map())
  * 5. Updates footer stats
  * 6. Renders the "Saved for Later" checklist
  */
+async function closeTabOutDupes() {
+  const extensionId = chrome.runtime.id;
+  const newtabUrl   = `chrome-extension://${extensionId}/index.html`;
+
+  const allTabs      = await chrome.tabs.query({});
+  const currentWindow = await chrome.windows.getCurrent();
+  const tabOutTabs   = allTabs.filter(t => t.url === newtabUrl);
+
+  if (tabOutTabs.length <= 1) return;
+
+  const keep =
+    tabOutTabs.find(t => t.active && t.windowId === currentWindow.id) ||
+    tabOutTabs.find(t => t.active) ||
+    tabOutTabs[0];
+  const toClose = tabOutTabs.filter(t => t.id !== keep.id).map(t => t.id);
+  if (toClose.length > 0) await chrome.tabs.remove(toClose);
+  await fetchOpenTabs();
+}
+
+function checkTabOutDupes() {
+  const extensionId = chrome.runtime.id;
+  const newtabUrl   = `chrome-extension://${extensionId}/index.html`;
+  const banner  = document.getElementById('tabOutDupeBanner');
+  const countEl = document.getElementById('tabOutDupeCount');
+  if (!banner) return;
+
+  chrome.tabs.query({}).then(allTabs => {
+    const tabOutTabs = allTabs.filter(t => t.url === newtabUrl);
+    if (tabOutTabs.length > 1) {
+      if (countEl) countEl.textContent = tabOutTabs.length;
+      banner.style.display = 'flex';
+    } else {
+      banner.style.display = 'none';
+    }
+  });
+}
+
+function flipDomainCards(container) {
+  const oldRects = new Map();
+  container.querySelectorAll('.mission-card[data-domain]').forEach(card => {
+    oldRects.set(card.dataset.domain, card.getBoundingClientRect());
+  });
+
+  return function playFlip() {
+    container.querySelectorAll('.mission-card[data-domain]').forEach(card => {
+      const domain = card.dataset.domain;
+      const newRect = card.getBoundingClientRect();
+      const oldRect = oldRects.get(domain);
+
+      if (oldRect) {
+        const dx = oldRect.left - newRect.left;
+        const dy = oldRect.top  - newRect.top;
+        if (dx === 0 && dy === 0) return;
+
+        card.style.transition = 'none';
+        card.style.transform  = `translate(${dx}px, ${dy}px)`;
+
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          card.style.transition = '';
+          card.style.transform  = '';
+        }));
+      } else {
+        card.style.transition = 'none';
+        card.style.opacity    = '0';
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          card.style.transition = 'opacity 0.3s ease';
+          card.style.opacity    = '';
+        }));
+      }
+    });
+  };
+}
+
 async function renderStaticDashboard() {
   // --- Header ---
   const greetingEl = document.getElementById('greeting');
@@ -1594,11 +1666,16 @@ async function renderStaticDashboard() {
     const tCount = filteredTabs.length;
     openTabsSectionCount.textContent =
       `${dCount} domain${dCount !== 1 ? 's' : ''} · ${tCount} tab${tCount !== 1 ? 's' : ''}`;
+    const playFlip = flipDomainCards(openTabsMissionsEl);
     openTabsMissionsEl.innerHTML = domainGroups.map(g => renderDomainCard(g)).join('');
+    playFlip();
     openTabsSection.style.display = 'block';
   } else if (openTabsSection) {
     openTabsSection.style.display = 'none';
   }
+
+  // --- Check for duplicate Tab Out tabs ---
+  checkTabOutDupes();
 
   // --- Render "Saved for Later" column ---
   await renderDeferredColumn();
@@ -1671,6 +1748,20 @@ document.addEventListener('click', async (e) => {
   if (action === 'close-icon-picker') {
     e.stopPropagation();
     closeIconPicker();
+    return;
+  }
+
+  // ---- Close duplicate Tab Out tabs ----
+  if (action === 'close-tabout-dupes') {
+    await closeTabOutDupes();
+    playCloseSound();
+    const banner = document.getElementById('tabOutDupeBanner');
+    if (banner) {
+      banner.style.transition = 'opacity 0.4s';
+      banner.style.opacity = '0';
+      setTimeout(() => { banner.style.display = 'none'; banner.style.opacity = '1'; }, 400);
+    }
+    showToast('Closed extra Tab Out tabs');
     return;
   }
 
@@ -1778,28 +1869,6 @@ document.addEventListener('click', async (e) => {
 
     showToast('Saved for later');
     await renderDeferredColumn();
-    return;
-  }
-
-  // ---- Check off a saved tab (moves it to archive) ----
-  if (action === 'check-deferred') {
-    const id = actionEl.dataset.deferredId;
-    if (!id) return;
-
-    await checkOffSavedTab(id);
-
-    // Animate: strikethrough first, then slide out
-    const item = actionEl.closest('.deferred-item');
-    if (item) {
-      item.classList.add('checked');
-      setTimeout(() => {
-        item.classList.add('removing');
-        setTimeout(() => {
-          item.remove();
-          renderDeferredColumn(); // refresh counts and archive
-        }, 300);
-      }, 800);
-    }
     return;
   }
 
