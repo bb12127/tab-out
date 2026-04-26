@@ -175,33 +175,6 @@ async function closeDuplicateTabs(urls, keepOne = true) {
   await fetchOpenTabs();
 }
 
-/**
- * closeTabOutDupes()
- *
- * Closes all duplicate Tab Out new-tab pages except the current one.
- */
-async function closeTabOutDupes() {
-  const extensionId = chrome.runtime.id;
-  const newtabUrl = `chrome-extension://${extensionId}/index.html`;
-
-  const allTabs = await chrome.tabs.query({});
-  const currentWindow = await chrome.windows.getCurrent();
-  const tabOutTabs = allTabs.filter(t =>
-    t.url === newtabUrl || t.url === 'chrome://newtab/'
-  );
-
-  if (tabOutTabs.length <= 1) return;
-
-  // Keep the active Tab Out tab in the CURRENT window — that's the one the
-  // user is looking at right now. Falls back to any active one, then the first.
-  const keep =
-    tabOutTabs.find(t => t.active && t.windowId === currentWindow.id) ||
-    tabOutTabs.find(t => t.active) ||
-    tabOutTabs[0];
-  const toClose = tabOutTabs.filter(t => t.id !== keep.id).map(t => t.id);
-  if (toClose.length > 0) await chrome.tabs.remove(toClose);
-  await fetchOpenTabs();
-}
 
 
 /* ----------------------------------------------------------------
@@ -975,25 +948,6 @@ function getRealTabs() {
   });
 }
 
-/**
- * checkTabOutDupes()
- *
- * Counts how many Tab Out pages are open. If more than 1,
- * shows a banner offering to close the extras.
- */
-function checkTabOutDupes() {
-  const tabOutTabs = openTabs.filter(t => t.isTabOut);
-  const banner  = document.getElementById('tabOutDupeBanner');
-  const countEl = document.getElementById('tabOutDupeCount');
-  if (!banner) return;
-
-  if (tabOutTabs.length > 1) {
-    if (countEl) countEl.textContent = tabOutTabs.length;
-    banner.style.display = 'flex';
-  } else {
-    banner.style.display = 'none';
-  }
-}
 
 
 /* ----------------------------------------------------------------
@@ -1646,9 +1600,6 @@ async function renderStaticDashboard() {
     openTabsSection.style.display = 'none';
   }
 
-  // --- Check for duplicate Tab Out tabs ---
-  checkTabOutDupes();
-
   // --- Render "Saved for Later" column ---
   await renderDeferredColumn();
 }
@@ -1720,20 +1671,6 @@ document.addEventListener('click', async (e) => {
   if (action === 'close-icon-picker') {
     e.stopPropagation();
     closeIconPicker();
-    return;
-  }
-
-  // ---- Close duplicate Tab Out tabs ----
-  if (action === 'close-tabout-dupes') {
-    await closeTabOutDupes();
-    playCloseSound();
-    const banner = document.getElementById('tabOutDupeBanner');
-    if (banner) {
-      banner.style.transition = 'opacity 0.4s';
-      banner.style.opacity = '0';
-      setTimeout(() => { banner.style.display = 'none'; banner.style.opacity = '1'; }, 400);
-    }
-    showToast('Closed extra Tab Out tabs');
     return;
   }
 
