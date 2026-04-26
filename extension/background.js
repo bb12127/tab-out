@@ -1,5 +1,5 @@
 /**
- * background.js — Service Worker for Badge Updates
+ * background.js — Service Worker for Badge Updates + Toolbar Launcher
  *
  * Chrome's "always-on" background script for Tab Out.
  * Its only job: keep the toolbar badge showing the current open tab count.
@@ -85,6 +85,46 @@ chrome.tabs.onRemoved.addListener(() => {
 // Update badge when a tab's URL changes (e.g. navigating to/from chrome://)
 chrome.tabs.onUpdated.addListener(() => {
   updateBadge();
+});
+
+// ─── Toolbar icon launcher ────────────────────────────────────────────────────
+//
+// Clicking the Tab Out icon opens the dashboard as a fresh tab right next to
+// wherever the user currently is. Any pre-existing Tab Out tab (in this or
+// any other window/workspace) is closed first — we never keep stale copies.
+chrome.action.onClicked.addListener(async () => {
+  const newtabUrl = chrome.runtime.getURL("index.html");
+
+  try {
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+    // If the user is already ON a Tab Out tab, just reload it — no need to
+    // close/recreate (would be destructive if it's the only tab in the window).
+    if (activeTab && activeTab.url === newtabUrl) {
+      await chrome.tabs.reload(activeTab.id);
+      return;
+    }
+
+    // Close any stale Tab Out copies elsewhere so only one ever exists.
+    const allTabs = await chrome.tabs.query({});
+    const stale   = allTabs.filter(t => t.url === newtabUrl);
+    if (stale.length > 0) {
+      await chrome.tabs.remove(stale.map(t => t.id));
+    }
+
+    // Open a fresh Tab Out tab in the current window, right after the active
+    // tab, in the active workspace (inherits workspace via index on Opera GX).
+    const createOpts = { url: newtabUrl, active: true };
+    if (activeTab) {
+      createOpts.windowId = activeTab.windowId;
+      if (typeof activeTab.index === 'number') createOpts.index = activeTab.index + 1;
+      if (activeTab.workspaceId) createOpts.workspaceId = activeTab.workspaceId;
+    }
+    await chrome.tabs.create(createOpts);
+  } catch (err) {
+    // Fallback: just create one somewhere
+    chrome.tabs.create({ url: newtabUrl });
+  }
 });
 
 // ─── Initial run ─────────────────────────────────────────────────────────────
