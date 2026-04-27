@@ -128,7 +128,11 @@
   <span id="toastText"></span>
 </div>
 
-<!-- Main dashboard logic — loads last so the DOM is ready -->
-<script src="app.js"></script>
+<!-- Main dashboard logic — loads last so the DOM is ready.
+     type="module" enables ES module imports across app.js and its
+     ./tabs.js, ./storage.js, ./format.js, ./effects.js, ./render.js,
+     ./icon-picker.js helpers. Also adds defer semantics, so DOMContentLoaded
+     is guaranteed by the time the module body runs. -->
+<script type="module" src="app.js"></script>
 </body>
 </html>
