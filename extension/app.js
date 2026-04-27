@@ -907,6 +907,132 @@ let domainGroups = [];
 // Opera GX workspace filter — null = "All", otherwise a workspaceId string
 let activeWorkspace = null;
 
+// Last-loaded domain→folder map; kept in sync so reorderDomainCard can use it
+let _domainFolderMap = {};
+
+// Active folder filter — null = "All", folder id = show only that folder
+let activeFolderId = null;
+
+// Whether the folder management panel is expanded
+let _folderManagePanelOpen = false;
+
+
+/* ----------------------------------------------------------------
+   UTILITY
+   ---------------------------------------------------------------- */
+const escHtml = s => String(s ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+
+/* ----------------------------------------------------------------
+   FOLDER STORAGE HELPERS
+   ---------------------------------------------------------------- */
+
+async function getFolders() {
+  const { folders = [] } = await chrome.storage.local.get('folders');
+  return folders.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+}
+
+async function saveFolders(arr) {
+  await chrome.storage.local.set({ folders: arr });
+}
+
+async function createFolder(name) {
+  const folders = await getFolders();
+  const folder = {
+    id: 'f-' + Date.now(),
+    name: (name || 'New Folder').trim(),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    order: folders.length,
+  };
+  folders.push(folder);
+  await saveFolders(folders);
+  return folder;
+}
+
+async function deleteFolder(id) {
+  const folders = (await getFolders()).filter(f => f.id !== id);
+  folders.forEach((f, i) => f.order = i);
+  await saveFolders(folders);
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  let dc = false;
+  deferred.forEach(x => { if (x.folderId === id) { x.folderId = null; dc = true; } });
+  if (dc) await chrome.storage.local.set({ deferred });
+  const { domainFolderMap = {} } = await chrome.storage.local.get('domainFolderMap');
+  let mc = false;
+  Object.keys(domainFolderMap).forEach(d => {
+    if (domainFolderMap[d] === id) { delete domainFolderMap[d]; mc = true; }
+  });
+  if (mc) await chrome.storage.local.set({ domainFolderMap });
+}
+
+async function moveFolderOrder(id, dir) {
+  const folders = await getFolders();
+  const i = folders.findIndex(f => f.id === id);
+  const j = dir === 'up' ? i - 1 : i + 1;
+  if (i < 0 || j < 0 || j >= folders.length) return;
+  [folders[i], folders[j]] = [folders[j], folders[i]];
+  folders.forEach((f, k) => f.order = k);
+  await saveFolders(folders);
+}
+
+async function setDomainFolder(domain, folderId) {
+  const { domainFolderMap = {} } = await chrome.storage.local.get('domainFolderMap');
+  if (folderId) domainFolderMap[domain] = folderId;
+  else          delete domainFolderMap[domain];
+  await chrome.storage.local.set({ domainFolderMap });
+  if (folderId) {
+    const folders = await getFolders();
+    const f = folders.find(x => x.id === folderId);
+    if (f) { f.updatedAt = Date.now(); await saveFolders(folders); }
+  }
+}
+
+async function setDeferredFolder(itemId, folderId) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const item = deferred.find(x => x.id === itemId);
+  if (item) { item.folderId = folderId || null; item.updatedAt = Date.now(); }
+  await chrome.storage.local.set({ deferred });
+  if (folderId) {
+    const folders = await getFolders();
+    const f = folders.find(x => x.id === folderId);
+    if (f) { f.updatedAt = Date.now(); await saveFolders(folders); }
+  }
+}
+
+async function reorderDeferredItem(itemId, dir) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const item = deferred.find(x => x.id === itemId);
+  if (!item) return;
+  const fid = item.folderId || null;
+  const sibs = deferred.filter(x => !x.dismissed && !x.completed && (x.folderId || null) === fid);
+  const si = sibs.findIndex(x => x.id === itemId);
+  const sj = dir === 'up' ? si - 1 : si + 1;
+  if (si < 0 || sj < 0 || sj >= sibs.length) return;
+  const di = deferred.indexOf(sibs[si]);
+  const dj = deferred.indexOf(sibs[sj]);
+  [deferred[di], deferred[dj]] = [deferred[dj], deferred[di]];
+  await chrome.storage.local.set({ deferred });
+}
+
+async function reorderDomainCard(domain, dir, folderId) {
+  const { domainFolderOrder = {} } = await chrome.storage.local.get('domainFolderOrder');
+  const key = folderId || '__root__';
+  const inFolder = domainGroups
+    .filter(g => (_domainFolderMap[g.domain] || null) === (folderId || null))
+    .map(g => g.domain);
+  let order = (domainFolderOrder[key] || []).filter(d => inFolder.includes(d));
+  inFolder.forEach(d => { if (!order.includes(d)) order.push(d); });
+  const i = order.indexOf(domain);
+  const j = dir === 'up' ? i - 1 : i + 1;
+  if (i < 0 || j < 0 || j >= order.length) return;
+  [order[i], order[j]] = [order[j], order[i]];
+  domainFolderOrder[key] = order;
+  await chrome.storage.local.set({ domainFolderOrder });
+}
+
 // Curated emoji library used by the workspace icon picker.
 // Grouped by category; the free-form input below accepts anything else.
 const EMOJI_CATEGORIES = [
@@ -994,12 +1120,12 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
    ---------------------------------------------------------------- */
 
 /**
- * renderDomainCard(group, groupIndex)
+ * renderDomainCard(group, folderId, domainFolderMap)
  *
  * Builds the HTML for one domain group card.
  * group = { domain: string, tabs: [{ url, title, id, windowId, active }] }
  */
-function renderDomainCard(group) {
+function renderDomainCard(group, folderId, domainFolderMap) {
   const tabs      = group.tabs || [];
   const tabCount  = tabs.length;
   const stableId  = 'domain-' + group.domain.replace(/[^a-z0-9]/g, '-');
@@ -1089,8 +1215,33 @@ function renderDomainCard(group) {
       </button>`;
   }
 
+  // Folder-related extras
+  const currentFolderId = folderId || null;
+  const folderBtnClass  = currentFolderId ? ' in-folder' : '';
+  const folderSvg = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12.75V12A2.25 2.25 0 0 1 4.5 9.75h15A2.25 2.25 0 0 1 21.75 12v.75m-8.69-6.44-2.12-2.12a1.5 1.5 0 0 0-1.061-.44H4.5A2.25 2.25 0 0 0 2.25 6v8.25A2.25 2.25 0 0 0 4.5 16.5h15a2.25 2.25 0 0 0 2.25-2.25V9a2.25 2.25 0 0 0-2.25-2.25h-5.379a1.5 1.5 0 0 1-1.06-.44Z"/></svg>`;
+  const upSvg   = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 15.75 7.5-7.5 7.5 7.5"/></svg>`;
+  const downSvg = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>`;
+
+  const folderRow = `
+    <div style="display:flex;align-items:center;gap:4px;margin-top:8px">
+      <button class="move-folder-btn${folderBtnClass}" data-action="move-domain-to-folder"
+        data-domain="${group.domain}" data-current-folder="${escHtml(currentFolderId || '')}"
+        title="Move to folder">${folderSvg}${currentFolderId ? '' : ''}</button>
+      <div class="card-reorder-btns">
+        <button class="card-reorder-btn" data-action="domain-up"
+          data-domain="${group.domain}" data-folder-id="${escHtml(currentFolderId || '')}"
+          title="Move card up">${upSvg}</button>
+        <button class="card-reorder-btn" data-action="domain-down"
+          data-domain="${group.domain}" data-folder-id="${escHtml(currentFolderId || '')}"
+          title="Move card down">${downSvg}</button>
+      </div>
+    </div>`;
+
   return `
-    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}" data-domain="${group.domain}">
+    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}"
+         data-domain-id="${stableId}" data-domain="${group.domain}"
+         data-folder-id="${escHtml(currentFolderId || '')}"
+         draggable="true">
       <div class="status-bar"></div>
       <div class="mission-content">
         <div class="mission-top">
@@ -1100,6 +1251,7 @@ function renderDomainCard(group) {
         </div>
         <div class="mission-pages">${pageChips}</div>
         <div class="actions">${actionsHtml}</div>
+        ${folderRow}
       </div>
       <div class="mission-meta">
         <div class="mission-page-count">${tabCount}</div>
@@ -1147,25 +1299,65 @@ async function renderDeferredColumn() {
 
     // Derive visible subsets AFTER migration so render sees fresh names.
     const visible  = deferred.filter(t => !t.dismissed);
-    const active   = visible.filter(t => !t.completed);
+    let   active   = visible.filter(t => !t.completed);
     const archived = visible.filter(t => t.completed);
 
+    // Apply folder filter when a specific folder is active
+    if (activeFolderId) {
+      active = active.filter(x => x.folderId === activeFolderId);
+    }
+
     // Hide the entire column if there's nothing to show
-    if (active.length === 0 && archived.length === 0) {
+    if (active.length === 0 && (activeFolderId || archived.length === 0)) {
+      if (activeFolderId && active.length === 0) {
+        // Show empty state for the folder rather than hiding the column entirely
+        column.style.display = 'block';
+        list.innerHTML = `<div class="folder-empty-state">Nothing saved in this folder yet.</div>`;
+        list.style.display = 'block';
+        empty.style.display = 'none';
+        archiveEl.style.display = 'none';
+        countEl.textContent = '';
+        return;
+      }
       column.style.display = 'none';
       return;
     }
 
     column.style.display = 'block';
 
-    // Render active checklist items (mix of individual tabs and saved groups)
+    // Render active checklist items
     if (active.length > 0) {
       countEl.textContent = `${active.length} item${active.length !== 1 ? 's' : ''}`;
-      list.innerHTML = active
-        .map(item => item.kind === 'group'
+      const folders = await getFolders();
+      let html = '';
+
+      if (activeFolderId) {
+        // Focused folder — render items flat, no nested folder sections
+        html += active.map(item => item.kind === 'group'
           ? renderDeferredGroup(item, storedIcons, liveWorkspaces)
-          : renderDeferredItem(item))
-        .join('');
+          : renderDeferredItem(item)
+        ).join('');
+      } else {
+        // "All" view — group by folder sections + unfiled
+        const hasFolderItems = folders.some(f => active.some(x => x.folderId === f.id));
+        for (const folder of folders) {
+          const inFolder = active.filter(x => x.folderId === folder.id);
+          if (inFolder.length === 0) continue;
+          html += renderSavedFolder(folder, inFolder, storedIcons, liveWorkspaces);
+        }
+        const unfiled = active.filter(x => !x.folderId);
+        if (unfiled.length > 0) {
+          if (hasFolderItems) {
+            html += `<div class="saved-unfiled-sep"><span class="saved-unfiled-label">Unfiled</span><div class="saved-unfiled-line"></div></div>`;
+          }
+          html += unfiled.map(item => item.kind === 'group'
+            ? renderDeferredGroup(item, storedIcons, liveWorkspaces)
+            : renderDeferredItem(item)
+          ).join('');
+        }
+      }
+
+      list.innerHTML = html;
       list.style.display = 'block';
       empty.style.display = 'none';
     } else {
@@ -1174,8 +1366,8 @@ async function renderDeferredColumn() {
       empty.style.display = 'block';
     }
 
-    // Render archive section (mix of individual tabs and archived groups)
-    if (archived.length > 0) {
+    // Render archive section — hidden when a folder filter is active
+    if (archived.length > 0 && !activeFolderId) {
       archiveCountEl.textContent = `(${archived.length})`;
       archiveList.innerHTML = archived
         .map(item => item.kind === 'group'
@@ -1203,19 +1395,32 @@ function renderDeferredItem(item) {
   let domain = '';
   try { domain = new URL(item.url).hostname.replace(/^www\./, ''); } catch {}
   const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=16`;
-  const ago = timeAgo(item.savedAt);
+  const savedAgo   = timeAgo(item.savedAt);
+  const changedAgo = item.updatedAt ? timeAgo(item.updatedAt) : null;
+  const folderCls  = item.folderId ? ' in-folder' : '';
 
   return `
-    <div class="deferred-item" data-deferred-id="${item.id}">
+    <div class="deferred-item" data-deferred-id="${item.id}" draggable="true">
+      <div class="reorder-btns">
+        <button class="reorder-btn" data-action="deferred-up" data-deferred-id="${item.id}" title="Move up">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 15.75 7.5-7.5 7.5 7.5"/></svg>
+        </button>
+        <button class="reorder-btn" data-action="deferred-down" data-deferred-id="${item.id}" title="Move down">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>
+        </button>
+      </div>
       <div class="deferred-info">
         <a href="${item.url}" target="_blank" rel="noopener" class="deferred-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
           <img src="${faviconUrl}" alt="" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px">${item.title || item.url}
         </a>
         <div class="deferred-meta">
           <span>${domain}</span>
-          <span>${ago}</span>
+          <span>${changedAgo ? 'changed ' + changedAgo : savedAgo}</span>
         </div>
       </div>
+      <button class="item-folder-btn${folderCls}" data-action="move-saved-to-folder"
+        data-deferred-id="${item.id}" data-current-folder="${escHtml(item.folderId || '')}"
+        title="Move to folder">${FOLDER_SVG}</button>
       <button class="deferred-restore" data-action="restore-deferred" data-deferred-id="${item.id}" title="Reopen as a tab">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M13.5 6H5.25A2.25 2.25 0 0 0 3 8.25v10.5A2.25 2.25 0 0 0 5.25 21h10.5A2.25 2.25 0 0 0 18 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" /></svg>
       </button>
@@ -1337,9 +1542,20 @@ function renderDeferredGroup(group, storedIcons = {}, liveWorkspaces = new Map()
       </div>`;
   }).join('');
 
+  const folderCls = group.folderId ? ' in-folder' : '';
+  const changedAgo = group.updatedAt ? timeAgo(group.updatedAt) : null;
+
   return `
-    <div class="deferred-group" data-group-id="${group.id}">
+    <div class="deferred-group" data-group-id="${group.id}" draggable="true">
       <div class="group-header">
+        <div class="reorder-btns">
+          <button class="reorder-btn" data-action="deferred-up" data-deferred-id="${group.id}" title="Move up">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 15.75 7.5-7.5 7.5 7.5"/></svg>
+          </button>
+          <button class="reorder-btn" data-action="deferred-down" data-deferred-id="${group.id}" title="Move down">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>
+          </button>
+        </div>
         <button class="group-toggle" data-action="toggle-group" data-group-id="${group.id}" title="Expand/collapse">
           <svg class="group-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>
         </button>
@@ -1349,8 +1565,11 @@ function renderDeferredGroup(group, storedIcons = {}, liveWorkspaces = new Map()
             <span class="group-header-label">${group.label || 'Group'}</span>
             <span class="group-header-count">${count} tab${count !== 1 ? 's' : ''}</span>
           </div>
-          <div class="group-header-meta">${metaHtml}</div>
+          <div class="group-header-meta">${changedAgo ? 'changed ' + changedAgo + ' · ' : ''}${metaHtml}</div>
         </div>
+        <button class="item-folder-btn${folderCls}" data-action="move-saved-to-folder"
+          data-deferred-id="${group.id}" data-current-folder="${escHtml(group.folderId || '')}"
+          title="Move to folder">${FOLDER_SVG}</button>
         <button class="group-header-action" data-action="restore-group-all" data-group-id="${group.id}" title="Reopen all tabs">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M13.5 6H5.25A2.25 2.25 0 0 0 3 8.25v10.5A2.25 2.25 0 0 0 5.25 21h10.5A2.25 2.25 0 0 0 18 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" /></svg>
         </button>
@@ -1504,6 +1723,18 @@ function flipDomainCards(container) {
         const dy = oldRect.top  - newRect.top;
         if (dx === 0 && dy === 0) return;
 
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > 250) {
+          // Too far to animate smoothly — fade in at new position instead
+          card.style.transition = 'none';
+          card.style.opacity    = '0';
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            card.style.transition = 'opacity 0.3s ease';
+            card.style.opacity    = '';
+          }));
+          return;
+        }
+
         card.style.transition = 'none';
         card.style.transform  = `translate(${dx}px, ${dy}px)`;
 
@@ -1521,6 +1752,160 @@ function flipDomainCards(container) {
       }
     });
   };
+}
+
+/* ----------------------------------------------------------------
+   FOLDER RENDER HELPERS
+   ---------------------------------------------------------------- */
+
+const FOLDER_SVG   = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12.75V12A2.25 2.25 0 0 1 4.5 9.75h15A2.25 2.25 0 0 1 21.75 12v.75m-8.69-6.44-2.12-2.12a1.5 1.5 0 0 0-1.061-.44H4.5A2.25 2.25 0 0 0 2.25 6v8.25A2.25 2.25 0 0 0 4.5 16.5h15a2.25 2.25 0 0 0 2.25-2.25V9a2.25 2.25 0 0 0-2.25-2.25h-5.379a1.5 1.5 0 0 1-1.06-.44Z"/></svg>`;
+const CHEVRON_DOWN = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>`;
+const CHEVRON_UP   = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 15.75 7.5-7.5 7.5 7.5"/></svg>`;
+const PENCIL_SVG   = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L6.832 19.82a4.5 4.5 0 0 1-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 0 1 1.13-1.897L16.863 4.487Z"/></svg>`;
+const TRASH_SVG    = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0"/></svg>`;
+
+function folderActionBtns(folderId) {
+  return `
+    <button class="tab-folder-btn" data-action="folder-up" data-folder-id="${folderId}" title="Move folder up">${CHEVRON_UP}</button>
+    <button class="tab-folder-btn" data-action="folder-down" data-folder-id="${folderId}" title="Move folder down">${CHEVRON_DOWN}</button>
+    <button class="tab-folder-btn" data-action="rename-folder" data-folder-id="${folderId}" title="Rename">${PENCIL_SVG}</button>
+    <button class="tab-folder-btn danger" data-action="delete-folder" data-folder-id="${folderId}" title="Delete folder">${TRASH_SVG}</button>`;
+}
+
+function renderOpenTabsWithFolders(folders, dfMap, domainFolderOrder) {
+  function orderedGroups(folderId) {
+    const key   = folderId || '__root__';
+    const inF   = domainGroups.filter(g => (dfMap[g.domain] || null) === (folderId || null));
+    const saved = (domainFolderOrder[key] || []).filter(d => inF.some(g => g.domain === d));
+    const rest  = inF.filter(g => !saved.includes(g.domain));
+    return [...saved.map(d => inF.find(g => g.domain === d)), ...rest].filter(Boolean);
+  }
+
+  // Folder-focused view — just show the cards for the active folder cleanly
+  if (activeFolderId) {
+    const groups = orderedGroups(activeFolderId);
+    if (groups.length === 0) {
+      return `<div class="folder-empty-state">No open tabs in this folder yet.</div>`;
+    }
+    return groups.map(g => renderDomainCard(g, activeFolderId, dfMap)).join('');
+  }
+
+  // "All" view — folder section headers + cards + unfiled
+  let html = '';
+  const hasFolderCards = folders.some(f => domainGroups.some(g => dfMap[g.domain] === f.id));
+
+  for (const folder of folders) {
+    const groups = orderedGroups(folder.id);
+    if (groups.length === 0) continue;
+    const ago = folder.updatedAt ? timeAgo(folder.updatedAt) : '';
+    html += `
+      <div class="tab-folder-header-card" data-action="toggle-tab-folder" data-folder-id="${folder.id}">
+        <svg class="tab-folder-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>
+        <span>${FOLDER_SVG}</span>
+        <span class="tab-folder-name">${escHtml(folder.name)}</span>
+        <span class="tab-folder-count">${groups.length}</span>
+        ${ago ? `<span class="tab-folder-updated">${ago}</span>` : ''}
+        <div class="tab-folder-actions">${folderActionBtns(folder.id)}</div>
+      </div>`;
+    for (const g of groups) html += renderDomainCard(g, folder.id, dfMap);
+  }
+
+  const unfiled = orderedGroups(null);
+  if (unfiled.length > 0 && hasFolderCards) {
+    html += `<div class="tab-unfiled-sep"><span class="tab-unfiled-label">Unfiled</span><div class="tab-unfiled-line"></div></div>`;
+  }
+  for (const g of unfiled) html += renderDomainCard(g, null, dfMap);
+  return html;
+}
+
+function renderSavedFolder(folder, items, storedIcons, liveWorkspaces) {
+  const ago = folder.updatedAt ? timeAgo(folder.updatedAt) : (folder.createdAt ? timeAgo(folder.createdAt) : '');
+  const actionBtns = `
+    <button class="saved-folder-btn" data-action="folder-up" data-folder-id="${folder.id}" title="Move up">${CHEVRON_UP}</button>
+    <button class="saved-folder-btn" data-action="folder-down" data-folder-id="${folder.id}" title="Move down">${CHEVRON_DOWN}</button>
+    <button class="saved-folder-btn" data-action="rename-folder" data-folder-id="${folder.id}" title="Rename">${PENCIL_SVG}</button>
+    <button class="saved-folder-btn danger" data-action="delete-folder" data-folder-id="${folder.id}" title="Delete">${TRASH_SVG}</button>`;
+  const body = items.map(item =>
+    item.kind === 'group'
+      ? renderDeferredGroup(item, storedIcons, liveWorkspaces)
+      : renderDeferredItem(item)
+  ).join('');
+  return `
+    <div class="saved-folder" data-saved-folder-id="${folder.id}">
+      <div class="saved-folder-header" data-action="toggle-saved-folder" data-folder-id="${folder.id}">
+        <svg class="saved-folder-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>
+        <span class="saved-folder-name">${escHtml(folder.name)}</span>
+        <div class="saved-folder-meta">
+          <span>${items.length}</span>
+          ${ago ? `<span>· ${ago}</span>` : ''}
+        </div>
+        <div class="saved-folder-actions">${actionBtns}</div>
+      </div>
+      <div class="saved-folder-body">${body}</div>
+    </div>`;
+}
+
+/* ----------------------------------------------------------------
+   FOLDER BAR — horizontal chip strip + management panel
+   ---------------------------------------------------------------- */
+
+const ADD_FOLDER_SVG = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>`;
+const GEAR_SVG = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94H9.75c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z"/><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"/></svg>`;
+
+function renderFolderBar(folders) {
+  const wrap = document.getElementById('folderBarWrap');
+  const bar  = document.getElementById('folderBar');
+  if (!bar || !wrap) return;
+
+  if (folders.length === 0) {
+    wrap.style.display = 'none';
+    return;
+  }
+
+  wrap.style.display = 'block';
+
+  const allActive = !activeFolderId ? ' active' : '';
+  let html = `<button class="folder-chip${allActive}" data-action="filter-folder" data-folder-id="">All</button>`;
+
+  for (const f of folders) {
+    const isActive = activeFolderId === f.id;
+    html += `<button class="folder-chip${isActive ? ' active' : ''}" data-action="filter-folder" data-folder-id="${escHtml(f.id)}">
+      ${FOLDER_SVG}<span class="folder-chip-name">${escHtml(f.name)}</span>
+    </button>`;
+  }
+
+  html += `<span class="folder-bar-spacer"></span>`;
+  html += `<button class="folder-chip-new" data-action="new-folder-bar" title="Create new folder">${ADD_FOLDER_SVG}New folder</button>`;
+  html += `<button class="folder-manage-toggle${_folderManagePanelOpen ? ' open' : ''}" data-action="toggle-folder-manage" title="Manage folders">${GEAR_SVG}Manage</button>`;
+
+  bar.innerHTML = html;
+}
+
+function renderFolderManagePanel(folders) {
+  const panel = document.getElementById('folderManagePanel');
+  if (!panel) return;
+
+  if (!_folderManagePanelOpen || folders.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+
+  panel.style.display = 'block';
+  let html = `<div class="folder-manage-list">`;
+  for (const f of folders) {
+    html += `<div class="folder-manage-row" data-folder-id="${escHtml(f.id)}">
+      <span class="folder-manage-icon">${FOLDER_SVG}</span>
+      <span class="folder-manage-name">${escHtml(f.name)}</span>
+      <div class="folder-manage-btns">
+        <button data-action="folder-up"     data-folder-id="${escHtml(f.id)}" title="Move up">${CHEVRON_UP}</button>
+        <button data-action="folder-down"   data-folder-id="${escHtml(f.id)}" title="Move down">${CHEVRON_DOWN}</button>
+        <button data-action="rename-folder" data-folder-id="${escHtml(f.id)}" title="Rename">${PENCIL_SVG}</button>
+        <button class="danger" data-action="delete-folder" data-folder-id="${escHtml(f.id)}" title="Delete">${TRASH_SVG}</button>
+      </div>
+    </div>`;
+  }
+  html += `</div>`;
+  panel.innerHTML = html;
 }
 
 async function renderStaticDashboard() {
@@ -1651,8 +2036,25 @@ async function renderStaticDashboard() {
     }
   }
 
-  // Sort by tab count descending — busiest domain first
-  domainGroups = Object.values(groupMap).sort((a, b) => b.tabs.length - a.tabs.length);
+  // Sort by tab count descending — busiest domain first; alphabetical tiebreaker
+  // keeps equal-count groups in a stable order across re-renders.
+  domainGroups = Object.values(groupMap).sort((a, b) => {
+    const diff = b.tabs.length - a.tabs.length;
+    return diff !== 0 ? diff : a.domain.localeCompare(b.domain);
+  });
+
+  // --- Load folder data (needed for bar + card rendering) ---
+  const [folders, dfMapRaw, { domainFolderOrder = {} }] = await Promise.all([
+    getFolders(),
+    chrome.storage.local.get('domainFolderMap'),
+    chrome.storage.local.get('domainFolderOrder'),
+  ]);
+  const dfMap = dfMapRaw.domainFolderMap || {};
+  _domainFolderMap = dfMap;
+
+  // Render global folder bar + management panel
+  renderFolderBar(folders);
+  renderFolderManagePanel(folders);
 
   // --- Render domain cards ---
   const openTabsSection      = document.getElementById('openTabsSection');
@@ -1667,7 +2069,7 @@ async function renderStaticDashboard() {
     openTabsSectionCount.textContent =
       `${dCount} domain${dCount !== 1 ? 's' : ''} · ${tCount} tab${tCount !== 1 ? 's' : ''}`;
     const playFlip = flipDomainCards(openTabsMissionsEl);
-    openTabsMissionsEl.innerHTML = domainGroups.map(g => renderDomainCard(g)).join('');
+    openTabsMissionsEl.innerHTML = renderOpenTabsWithFolders(folders, dfMap, domainFolderOrder);
     playFlip();
     openTabsSection.style.display = 'block';
   } else if (openTabsSection) {
@@ -1792,6 +2194,7 @@ document.addEventListener('click', async (e) => {
     const tabUrl = actionEl.dataset.tabUrl;
     if (!tabUrl) return;
 
+    suppressAutoRefresh();
     // Close the tab in Chrome directly
     const allTabs = await chrome.tabs.query({});
     const match   = allTabs.find(t => t.url === tabUrl);
@@ -1833,6 +2236,7 @@ document.addEventListener('click', async (e) => {
     const tabTitle = actionEl.dataset.tabTitle || tabUrl;
     if (!tabUrl) return;
 
+    suppressAutoRefresh();
     // Find the source tab so we can remember its Opera GX workspace + position
     const sourceTab = openTabs.find(t => t.url === tabUrl);
 
@@ -1960,6 +2364,7 @@ document.addEventListener('click', async (e) => {
 
   // ---- Save the whole domain group for later (active checklist) ----
   if (action === 'save-domain-group' || action === 'archive-domain-group') {
+    suppressAutoRefresh();
     const directToArchive = action === 'archive-domain-group';
     const domainId = actionEl.dataset.domainId;
     const group    = domainGroups.find(g =>
@@ -2241,6 +2646,7 @@ document.addEventListener('click', async (e) => {
 
   // ---- Close all tabs in a domain group ----
   if (action === 'close-domain-tabs') {
+    suppressAutoRefresh();
     const domainId = actionEl.dataset.domainId;
     const group    = domainGroups.find(g => {
       return 'domain-' + g.domain.replace(/[^a-z0-9]/g, '-') === domainId;
@@ -2324,6 +2730,245 @@ document.addEventListener('click', (e) => {
   }
 });
 
+/* ----------------------------------------------------------------
+   FOLDER ACTION HANDLERS — new-folder, rename, delete, reorder,
+   toggle-collapse, move-to-folder, deferred/domain reorder
+   ---------------------------------------------------------------- */
+
+document.addEventListener('click', async (e) => {
+  const a = e.target.closest('[data-action]');
+  if (!a) return;
+  const act = a.dataset.action;
+
+  // ---- Filter by folder (folder bar chip click) ----
+  if (act === 'filter-folder') {
+    const fid = a.dataset.folderId || null;
+    if (activeFolderId === fid) return;
+    activeFolderId = fid;
+    await Promise.all([renderStaticDashboard(), renderDeferredColumn()]);
+    return;
+  }
+
+  // ---- Create new folder from the folder bar ----
+  if (act === 'new-folder-bar') {
+    const folder = await createFolder('New Folder');
+    activeFolderId = folder.id;
+    _folderManagePanelOpen = true;
+    await Promise.all([renderStaticDashboard(), renderDeferredColumn()]);
+    // Start rename immediately in the manage panel
+    const nameEl = document.querySelector(`.folder-manage-row[data-folder-id="${folder.id}"] .folder-manage-name`);
+    if (nameEl) startFolderRename(nameEl, folder.id);
+    return;
+  }
+
+  // ---- Toggle folder management panel ----
+  if (act === 'toggle-folder-manage') {
+    _folderManagePanelOpen = !_folderManagePanelOpen;
+    const folders = await getFolders();
+    renderFolderManagePanel(folders);
+    document.querySelectorAll('[data-action="toggle-folder-manage"]')
+      .forEach(btn => btn.classList.toggle('open', _folderManagePanelOpen));
+    return;
+  }
+
+  // ---- Create new folder (section-level button) ----
+  if (act === 'new-folder') {
+    const section = a.dataset.section; // "open" or "saved"
+    const folder = await createFolder('New Folder');
+    if (section === 'open') {
+      await renderStaticDashboard();
+    } else {
+      await renderDeferredColumn();
+    }
+    // Immediately start renaming it
+    const nameEl = document.querySelector(`[data-folder-id="${folder.id}"] .tab-folder-name, [data-saved-folder-id="${folder.id}"] .saved-folder-name`);
+    if (nameEl) startFolderRename(nameEl, folder.id);
+    return;
+  }
+
+  // ---- Toggle open-tabs folder collapse ----
+  if (act === 'toggle-tab-folder') {
+    e.stopPropagation();
+    const folderId = a.dataset.folderId;
+    a.classList.toggle('collapsed');
+    const collapsed = a.classList.contains('collapsed');
+    document.querySelectorAll(`.mission-card[data-folder-id="${folderId}"]`)
+      .forEach(c => c.classList.toggle('folder-hidden', collapsed));
+    return;
+  }
+
+  // ---- Toggle saved-column folder collapse ----
+  if (act === 'toggle-saved-folder') {
+    e.stopPropagation();
+    const folder = a.closest('.saved-folder');
+    if (folder) folder.classList.toggle('collapsed');
+    return;
+  }
+
+  // ---- Rename folder ----
+  if (act === 'rename-folder') {
+    e.stopPropagation();
+    const folderId = a.dataset.folderId;
+    const nameEl = document.querySelector(
+      `.folder-manage-row[data-folder-id="${folderId}"] .folder-manage-name,
+       [data-action="toggle-tab-folder"][data-folder-id="${folderId}"] .tab-folder-name,
+       [data-action="toggle-saved-folder"][data-folder-id="${folderId}"] .saved-folder-name`
+    );
+    if (nameEl) startFolderRename(nameEl, folderId);
+    return;
+  }
+
+  // ---- Delete folder ----
+  if (act === 'delete-folder') {
+    e.stopPropagation();
+    const folderId = a.dataset.folderId;
+    if (activeFolderId === folderId) activeFolderId = null;
+    await deleteFolder(folderId);
+    await Promise.all([renderStaticDashboard(), renderDeferredColumn()]);
+    showToast('Folder deleted — items moved to unfiled');
+    return;
+  }
+
+  // ---- Reorder folder up / down ----
+  if (act === 'folder-up' || act === 'folder-down') {
+    e.stopPropagation();
+    const folderId = a.dataset.folderId;
+    await moveFolderOrder(folderId, act === 'folder-up' ? 'up' : 'down');
+    await Promise.all([renderStaticDashboard(), renderDeferredColumn()]);
+    return;
+  }
+
+  // ---- Move domain card to folder (show picker) ----
+  if (act === 'move-domain-to-folder') {
+    e.stopPropagation();
+    const domain    = a.dataset.domain;
+    const currentFo = a.dataset.currentFolder || null;
+    const folders   = await getFolders();
+    showFolderPicker(a, folders, currentFo, async (folderId) => {
+      await setDomainFolder(domain, folderId);
+      await renderStaticDashboard();
+    });
+    return;
+  }
+
+  // ---- Move saved item to folder (show picker) ----
+  if (act === 'move-saved-to-folder') {
+    e.stopPropagation();
+    const itemId    = a.dataset.deferredId;
+    const currentFo = a.dataset.currentFolder || null;
+    const folders   = await getFolders();
+    showFolderPicker(a, folders, currentFo, async (folderId) => {
+      await setDeferredFolder(itemId, folderId);
+      await renderDeferredColumn();
+    });
+    return;
+  }
+
+  // ---- Reorder saved item up / down ----
+  if (act === 'deferred-up' || act === 'deferred-down') {
+    e.stopPropagation();
+    const itemId = a.dataset.deferredId;
+    await reorderDeferredItem(itemId, act === 'deferred-up' ? 'up' : 'down');
+    await renderDeferredColumn();
+    return;
+  }
+
+  // ---- Reorder domain card up / down ----
+  if (act === 'domain-up' || act === 'domain-down') {
+    e.stopPropagation();
+    const domain   = a.dataset.domain;
+    const folderId = a.dataset.folderId || null;
+    await reorderDomainCard(domain, act === 'domain-up' ? 'up' : 'down', folderId || null);
+    await renderStaticDashboard();
+    return;
+  }
+});
+
+// ---- Folder picker: close on outside click ----
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.folder-picker')) closeFolderPicker();
+});
+
+/* ----------------------------------------------------------------
+   FOLDER PICKER HELPER
+   ---------------------------------------------------------------- */
+
+let _folderPickerCallback = null;
+
+function showFolderPicker(anchor, folders, currentFolderId, onSelect) {
+  closeFolderPicker();
+  _folderPickerCallback = onSelect;
+
+  const picker = document.createElement('div');
+  picker.className = 'folder-picker';
+  picker.id = 'folderPicker';
+
+  const noFolderCls = !currentFolderId ? ' current' : '';
+  picker.innerHTML = `
+    <button class="folder-picker-item${noFolderCls}" data-pick-folder="">
+      <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12"/></svg>
+      No folder (unfiled)
+    </button>
+    ${folders.length ? '<div class="folder-picker-sep"></div>' : ''}
+    ${folders.map(f => {
+      const cls = f.id === currentFolderId ? ' current' : '';
+      return `<button class="folder-picker-item${cls}" data-pick-folder="${f.id}">
+        ${FOLDER_SVG} ${escHtml(f.name)}
+      </button>`;
+    }).join('')}`;
+
+  document.body.appendChild(picker);
+
+  const rect = anchor.getBoundingClientRect();
+  picker.style.top  = (rect.bottom + window.scrollY + 4) + 'px';
+  picker.style.left = (rect.left  + window.scrollX)     + 'px';
+
+  picker.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-pick-folder]');
+    if (!btn) return;
+    const fid = btn.dataset.pickFolder || null;
+    closeFolderPicker();
+    if (_folderPickerCallback) await _folderPickerCallback(fid);
+    _folderPickerCallback = null;
+  });
+}
+
+function closeFolderPicker() {
+  document.getElementById('folderPicker')?.remove();
+}
+
+/* ----------------------------------------------------------------
+   FOLDER NAME INLINE EDIT
+   ---------------------------------------------------------------- */
+
+function startFolderRename(nameEl, folderId) {
+  const oldName  = nameEl.textContent.trim();
+  const isTab    = nameEl.classList.contains('tab-folder-name');
+  const isManage = nameEl.classList.contains('folder-manage-name');
+  const cls      = isTab ? 'tab-folder-name-input' : isManage ? 'folder-manage-name-input' : 'saved-folder-name-input';
+
+  const input = document.createElement('input');
+  input.className = cls;
+  input.value     = oldName;
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
+
+  async function save() {
+    const newName = input.value.trim() || oldName;
+    const folders = await getFolders();
+    const f = folders.find(x => x.id === folderId);
+    if (f) { f.name = newName; f.updatedAt = Date.now(); await saveFolders(folders); }
+    await Promise.all([renderStaticDashboard(), renderDeferredColumn()]);
+  }
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter')  { e.preventDefault(); save(); }
+    if (e.key === 'Escape') { input.value = oldName; save(); }
+  });
+  input.addEventListener('blur', save);
+}
+
 // ---- Icon picker: click-outside closes it, Escape closes it ----
 document.addEventListener('click', (e) => {
   const picker = document.getElementById('iconPicker');
@@ -2335,8 +2980,128 @@ document.addEventListener('click', (e) => {
 
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
+  closeFolderPicker();
   const picker = document.getElementById('iconPicker');
   if (picker && picker.style.display !== 'none') closeIconPicker();
+});
+
+/* ----------------------------------------------------------------
+   DRAG-AND-DROP — move domain cards and saved items into folders
+   ---------------------------------------------------------------- */
+
+(function initDragAndDrop() {
+  // Domain cards → open-tabs folder headers
+  document.addEventListener('dragstart', (e) => {
+    const card = e.target.closest('.mission-card[data-domain]');
+    if (card) {
+      e.dataTransfer.setData('text/plain', JSON.stringify({ type: 'domain', domain: card.dataset.domain }));
+      e.dataTransfer.effectAllowed = 'move';
+      return;
+    }
+    const item = e.target.closest('.deferred-item[data-deferred-id], .deferred-group[data-group-id]');
+    if (item) {
+      const id = item.dataset.deferredId || item.dataset.groupId;
+      e.dataTransfer.setData('text/plain', JSON.stringify({ type: 'deferred', id }));
+      e.dataTransfer.effectAllowed = 'move';
+    }
+  });
+
+  document.addEventListener('dragover', (e) => {
+    const tabHeader   = e.target.closest('.tab-folder-header-card');
+    const savedHeader = e.target.closest('.saved-folder-header');
+    const target = tabHeader || savedHeader;
+    if (!target) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    target.classList.add('drop-target');
+  });
+
+  document.addEventListener('dragleave', (e) => {
+    const target = e.target.closest('.tab-folder-header-card, .saved-folder-header');
+    if (target) target.classList.remove('drop-target');
+  });
+
+  document.addEventListener('drop', async (e) => {
+    const tabHeader   = e.target.closest('.tab-folder-header-card');
+    const savedHeader = e.target.closest('.saved-folder-header');
+    const target = tabHeader || savedHeader;
+    if (!target) return;
+    target.classList.remove('drop-target');
+    e.preventDefault();
+    try {
+      const data = JSON.parse(e.dataTransfer.getData('text/plain'));
+      const folderId = target.dataset.folderId;
+      if (data.type === 'domain' && tabHeader) {
+        await setDomainFolder(data.domain, folderId);
+        await renderStaticDashboard();
+      } else if (data.type === 'deferred' && savedHeader) {
+        await setDeferredFolder(data.id, folderId);
+        await renderDeferredColumn();
+      }
+    } catch {}
+  });
+})();
+
+/* ----------------------------------------------------------------
+   GLOBAL SEARCH — filters both columns in real time
+   ---------------------------------------------------------------- */
+
+function applySearch(query) {
+  const q = query.toLowerCase().trim();
+  const wrap = document.getElementById('searchBarWrap');
+  if (wrap) wrap.classList.toggle('has-query', q.length > 0);
+
+  // Filter open-tab domain cards
+  document.querySelectorAll('.mission-card[data-domain]').forEach(card => {
+    const domain = (card.dataset.domain || '').toLowerCase();
+    const titles = Array.from(card.querySelectorAll('.chip-text'))
+      .map(el => el.textContent.toLowerCase()).join(' ');
+    card.style.display = (!q || domain.includes(q) || titles.includes(q)) ? '' : 'none';
+  });
+
+  // Show/hide folder headers based on whether they have visible cards
+  document.querySelectorAll('.tab-folder-header-card[data-folder-id]').forEach(header => {
+    if (!q) { header.style.display = ''; return; }
+    const fid = header.dataset.folderId;
+    const anyVisible = Array.from(
+      document.querySelectorAll(`.mission-card[data-folder-id="${fid}"]`)
+    ).some(c => c.style.display !== 'none');
+    header.style.display = anyVisible ? '' : 'none';
+  });
+
+  // Filter saved items
+  document.querySelectorAll('.deferred-item[data-deferred-id]').forEach(item => {
+    const title  = (item.querySelector('.deferred-title')?.textContent || '').toLowerCase();
+    const domain = (item.querySelector('.deferred-meta span')?.textContent || '').toLowerCase();
+    item.style.display = (!q || title.includes(q) || domain.includes(q)) ? '' : 'none';
+  });
+
+  document.querySelectorAll('.deferred-group[data-group-id]').forEach(group => {
+    const label = (group.querySelector('.group-header-label')?.textContent || '').toLowerCase();
+    const texts = Array.from(group.querySelectorAll('.group-item-text'))
+      .map(el => el.textContent.toLowerCase()).join(' ');
+    group.style.display = (!q || label.includes(q) || texts.includes(q)) ? '' : 'none';
+  });
+
+  // Show/hide saved folder wrappers
+  document.querySelectorAll('.saved-folder[data-saved-folder-id]').forEach(sf => {
+    if (!q) { sf.style.display = ''; return; }
+    const anyVisible = Array.from(
+      sf.querySelectorAll('.deferred-item, .deferred-group')
+    ).some(el => el.style.display !== 'none');
+    sf.style.display = anyVisible ? '' : 'none';
+  });
+}
+
+document.addEventListener('input', (e) => {
+  if (e.target.id === 'searchBar') applySearch(e.target.value);
+});
+
+document.addEventListener('click', (e) => {
+  if (e.target.closest('#searchClearBtn')) {
+    const bar = document.getElementById('searchBar');
+    if (bar) { bar.value = ''; applySearch(''); }
+  }
 });
 
 // ---- Icon picker: free-form input (accepts any emoji / paste / Win+.) ----
@@ -2502,7 +3267,19 @@ document.addEventListener('error', (e) => {
    ---------------------------------------------------------------- */
 
 let __renderDebounceTimer = null;
+let __autoRefreshSuppressed = false;
+let __autoRefreshSuppressTimer = null;
+
+function suppressAutoRefresh(ms = 1200) {
+  __autoRefreshSuppressed = true;
+  clearTimeout(__autoRefreshSuppressTimer);
+  __autoRefreshSuppressTimer = setTimeout(() => {
+    __autoRefreshSuppressed = false;
+  }, ms);
+}
+
 function scheduleDashboardRefresh(delay = 400) {
+  if (__autoRefreshSuppressed) return;
   if (__renderDebounceTimer) clearTimeout(__renderDebounceTimer);
   __renderDebounceTimer = setTimeout(() => {
     __renderDebounceTimer = null;
