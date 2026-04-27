@@ -1,0 +1,215 @@
+================================================================
+TAB OUT — REFACTOR HANDOFF
+================================================================
+
+Date: 2026-04-28
+Scope: Split extension/app.js (was 2,532 lines) into focused ES
+       modules. Behavior-preserving — no features added or removed.
+
+
+----------------------------------------------------------------
+1. WHAT CHANGED
+----------------------------------------------------------------
+
+extension/app.js was a single monolithic file. It is now an
+orchestrator (1,155 lines) that imports from six new helper
+modules.
+
+Files added (all in extension/):
+  - format.js         pure string / domain / date helpers
+  - effects.js        Web Audio swoosh, confetti, FLIP, toast,
+                      empty-state, animateCardOut
+  - storage.js        chrome.storage.local CRUD for deferred tabs,
+                      saved groups, workspace icons + the workspace
+                      name migration helper
+  - tabs.js           chrome.tabs / chrome.windows wrappers; owns
+                      the openTabs snapshot privately and exposes
+                      it via getOpenTabs()
+  - render.js         pure HTML string builders + ICONS const +
+                      buildLiveWorkspaceMap (now takes openTabs as
+                      an argument instead of closing over a global)
+  - icon-picker.js    workspace emoji picker popover +
+                      EMOJI_CATEGORIES const
+
+Files modified:
+  - app.js            slimmed to render orchestration + click
+                      handler + live tab sync + init. Imports from
+                      all six helpers above.
+  - index.html        the script tag for app.js was changed to
+                      type="module" during the refactor, then later
+                      reverted in your working copy. See section 3
+                      below — this MUST be type="module" for the
+                      refactored code to load.
+
+Files NOT modified:
+  - background.js     service worker, untouched
+  - manifest.json     unchanged (MV3 page contexts already support
+                      ES modules; no manifest tweak needed)
+  - style.css         unchanged
+  - config.local.js   unchanged (still empty, still gitignored)
+
+
+----------------------------------------------------------------
+2. DEPENDENCY GRAPH
+----------------------------------------------------------------
+
+  format.js, effects.js, icon-picker.js, tabs.js   (no imports)
+                |
+                v
+  storage.js  -> format.js  (uses friendlyDomain in saveGroupForLater)
+  render.js   -> format.js  (uses cleanTitle, smartTitle, timeAgo, etc.)
+                |
+                v
+  app.js      -> tabs, storage, format, effects, render, icon-picker
+
+No cycles. Acyclic and bottom-up — leaf modules can be replaced
+or unit-tested in isolation.
+
+
+----------------------------------------------------------------
+3. PENDING STEP — index.html
+----------------------------------------------------------------
+
+For the refactored code to run, line 132 of extension/index.html
+needs the type="module" attribute:
+
+    <script type="module" src="app.js"></script>
+
+The current value (<script src="app.js">) will fail at load time
+because app.js now uses `import` statements at the top — those are
+syntax errors in a non-module script context.
+
+When you open the new tab page in Chrome with the current
+index.html, you'll see a SyntaxError in DevTools Console:
+  "Cannot use import statement outside a module"
+
+Fix: add type="module" to the script tag. Nothing else needs to
+change. Module scripts have implicit defer semantics so loading
+order with the DOM is identical to the previous behavior.
+
+
+----------------------------------------------------------------
+4. ONE BEHAVIORAL TWEAK (NOT A REGRESSION)
+----------------------------------------------------------------
+
+buildLiveWorkspaceMap() previously closed over the module-level
+`openTabs` global. It now takes openTabs as its first argument
+because it lives in render.js and openTabs lives in tabs.js.
+
+Both call sites in app.js were updated to pass getOpenTabs():
+  - renderDeferredColumn() in app.js
+  - the archive-search input handler in app.js
+
+This is functionally identical — getOpenTabs() returns the same
+array reference each render — but be aware if you grep for
+"buildLiveWorkspaceMap" later.
+
+
+----------------------------------------------------------------
+5. EXPLICITLY OUT OF SCOPE
+----------------------------------------------------------------
+
+The following were considered and intentionally left for follow-up
+sessions if you want them. They are NOT bugs in the current state.
+
+  - The 600-line click handler in app.js was kept whole. Splitting
+    it into per-action handlers is a separate refactor.
+  - No state-manager pattern, no observer pattern, no event bus.
+    domainGroups and activeWorkspace are still let-bindings in
+    app.js, mutated directly by the click handler and reads in
+    renderStaticDashboard.
+  - No TypeScript, no build step, no bundler. Native ES modules.
+  - background.js was not touched.
+  - No tests were added (none existed before).
+  - No visual or behavioral changes.
+
+
+----------------------------------------------------------------
+6. VERIFICATION CHECKLIST
+----------------------------------------------------------------
+
+After fixing index.html line 132 (see section 3), reload the
+extension at chrome://extensions/ and open a new tab. Confirm:
+
+  [ ] Greeting + date render at top
+  [ ] Open tabs render as domain cards with favicons
+  [ ] Clicking a tab chip focuses that tab
+  [ ] Save for later on a single tab moves it to the right column
+  [ ] Save group on a domain card creates a saved group entry
+  [ ] Close all on a domain card plays swoosh + confetti, then
+      animates the card out
+  [ ] Close duplicates badge appears when a URL is open >1 time
+  [ ] Workspace filter pills appear (Opera GX, with >=2 workspaces)
+  [ ] Workspace emoji edit (pencil -> picker -> pick) persists
+      across reloads
+  [ ] Archive toggle expands; archive search filters items
+  [ ] Restore from archive moves item back to active saved
+  [ ] Reopen a saved group restores all tabs in original workspace
+  [ ] FLIP animation: close one card and watch the others slide
+  [ ] Empty state appears when all tabs are closed
+  [ ] Tab Out duplicate banner shows with multiple new-tab pages
+
+DevTools checks:
+  [ ] Console: no errors, no [tab-out] warnings
+  [ ] Network: all six new .js files load with status 200
+  [ ] Application -> Storage: deferred and workspaceIcons keys
+      are present with the same shape as before
+
+
+----------------------------------------------------------------
+7. WHERE THINGS LIVE NOW (QUICK INDEX)
+----------------------------------------------------------------
+
+If you want to find...
+
+  Tab close / focus / dedup logic    -> tabs.js
+  Saved tabs / groups CRUD           -> storage.js
+  Workspace name migration           -> storage.js (migrateWorkspaceNames)
+  Workspace icon get/set             -> storage.js
+  Greeting / date / friendly domain  -> format.js
+  Title cleanup (cleanTitle, etc.)   -> format.js
+  Swoosh sound                       -> effects.js (playCloseSound)
+  Confetti                           -> effects.js (shootConfetti)
+  FLIP animation                     -> effects.js (flipDomainCards)
+  Toast                              -> effects.js (showToast)
+  Empty-state message                -> effects.js (checkAndShowEmptyState)
+  Domain card HTML                   -> render.js (renderDomainCard)
+  Saved-for-later HTML               -> render.js (renderDeferredItem,
+                                                  renderDeferredGroup,
+                                                  renderArchiveItem,
+                                                  renderArchiveGroup)
+  Workspace badge HTML               -> render.js (buildGroupWorkspaceBadge)
+  Live workspace map                 -> render.js (buildLiveWorkspaceMap)
+  Emoji picker popover               -> icon-picker.js
+  Workspace filter bar HTML          -> app.js (inline in renderStaticDashboard)
+  Click handler / event delegation   -> app.js
+  Live tab sync (chrome.tabs events) -> app.js (scheduleDashboardRefresh)
+  Tab Out duplicate detection        -> app.js (closeTabOutDupes,
+                                                checkTabOutDupes)
+
+
+----------------------------------------------------------------
+8. LINE COUNTS BEFORE / AFTER
+----------------------------------------------------------------
+
+  Before:  app.js                     2,532 lines
+                                      ----- TOTAL: 2,532
+
+  After:   app.js                     1,155 lines  (-54%)
+           render.js                    452
+           storage.js                   299
+           effects.js                   236
+           format.js                    229
+           tabs.js                      198
+           icon-picker.js               100
+                                      ----- TOTAL: 2,669  (+5% net)
+
+The +5% net is import/export blocks, module headers, and one
+function whose signature changed (buildLiveWorkspaceMap now takes
+a parameter). Each individual file is small enough to hold in your
+head; the largest (render.js at 452) is mostly multi-line HTML
+template strings.
+
+================================================================
+END OF HANDOFF
+================================================================
