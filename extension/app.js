@@ -1280,6 +1280,7 @@ async function renderDeferredColumn() {
   const archiveEl      = document.getElementById('deferredArchive');
   const archiveCountEl = document.getElementById('archiveCount');
   const archiveList    = document.getElementById('archiveList');
+  const titleEl        = document.getElementById('deferredSectionTitle');
 
   if (!column) return;
 
@@ -1302,15 +1303,22 @@ async function renderDeferredColumn() {
     let   active   = visible.filter(t => !t.completed);
     const archived = visible.filter(t => t.completed);
 
-    // Apply folder filter when a specific folder is active
+    // Resolve folders + active folder name for title
+    const folders = await getFolders();
+    let activeFolderName = null;
     if (activeFolderId) {
+      const af = folders.find(f => f.id === activeFolderId);
+      activeFolderName = af ? af.name : null;
       active = active.filter(x => x.folderId === activeFolderId);
     }
 
+    // Update column title to reflect current folder or default
+    if (titleEl) titleEl.textContent = activeFolderName || 'Saved for later';
+
     // Hide the entire column if there's nothing to show
     if (active.length === 0 && (activeFolderId || archived.length === 0)) {
-      if (activeFolderId && active.length === 0) {
-        // Show empty state for the folder rather than hiding the column entirely
+      if (activeFolderId) {
+        // Show empty state for the focused folder rather than hiding the column
         column.style.display = 'block';
         list.innerHTML = `<div class="folder-empty-state">Nothing saved in this folder yet.</div>`;
         list.style.display = 'block';
@@ -1328,7 +1336,6 @@ async function renderDeferredColumn() {
     // Render active checklist items
     if (active.length > 0) {
       countEl.textContent = `${active.length} item${active.length !== 1 ? 's' : ''}`;
-      const folders = await getFolders();
       let html = '';
 
       if (activeFolderId) {
@@ -1783,11 +1790,23 @@ function renderOpenTabsWithFolders(folders, dfMap, domainFolderOrder) {
 
   // Folder-focused view — just show the cards for the active folder cleanly
   if (activeFolderId) {
+    const activeFolder = folders.find(f => f.id === activeFolderId);
+    const focusHeader = `
+      <div class="folder-focus-header">
+        <span class="folder-focus-header-name">
+          ${FOLDER_SVG}${activeFolder ? escHtml(activeFolder.name) : 'Folder'}
+        </span>
+        <span class="folder-focus-spacer"></span>
+        <button class="folder-focus-clear" data-action="filter-folder" data-folder-id="" title="Back to all tabs">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12"/></svg>
+          All tabs
+        </button>
+      </div>`;
     const groups = orderedGroups(activeFolderId);
     if (groups.length === 0) {
-      return `<div class="folder-empty-state">No open tabs in this folder yet.</div>`;
+      return focusHeader + `<div class="folder-empty-state">No open tabs in this folder yet.<br>Drag a card here or use the folder button on any card.</div>`;
     }
-    return groups.map(g => renderDomainCard(g, activeFolderId, dfMap)).join('');
+    return focusHeader + groups.map(g => renderDomainCard(g, activeFolderId, dfMap)).join('');
   }
 
   // "All" view — folder section headers + cards + unfiled
@@ -1865,13 +1884,13 @@ function renderFolderBar(folders) {
   wrap.style.display = 'block';
 
   const allActive = !activeFolderId ? ' active' : '';
-  let html = `<button class="folder-chip${allActive}" data-action="filter-folder" data-folder-id="">All</button>`;
+  // "All" chip has a small grid icon to match the folder chips visually
+  const ALL_SVG = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25A2.25 2.25 0 0 1 13.5 18v-2.25Z"/></svg>`;
+  let html = `<button class="folder-chip${allActive}" data-action="filter-folder" data-folder-id="">${ALL_SVG}All</button>`;
 
   for (const f of folders) {
     const isActive = activeFolderId === f.id;
-    html += `<button class="folder-chip${isActive ? ' active' : ''}" data-action="filter-folder" data-folder-id="${escHtml(f.id)}">
-      ${FOLDER_SVG}<span class="folder-chip-name">${escHtml(f.name)}</span>
-    </button>`;
+    html += `<button class="folder-chip${isActive ? ' active' : ''}" data-action="filter-folder" data-folder-id="${escHtml(f.id)}">${FOLDER_SVG}<span class="folder-chip-name">${escHtml(f.name)}</span></button>`;
   }
 
   html += `<span class="folder-bar-spacer"></span>`;
@@ -1893,7 +1912,8 @@ function renderFolderManagePanel(folders) {
   panel.style.display = 'block';
   let html = `<div class="folder-manage-list">`;
   for (const f of folders) {
-    html += `<div class="folder-manage-row" data-folder-id="${escHtml(f.id)}">
+    const isActive = activeFolderId === f.id;
+    html += `<div class="folder-manage-row${isActive ? ' is-active' : ''}" data-folder-id="${escHtml(f.id)}">
       <span class="folder-manage-icon">${FOLDER_SVG}</span>
       <span class="folder-manage-name">${escHtml(f.name)}</span>
       <div class="folder-manage-btns">
@@ -2063,11 +2083,27 @@ async function renderStaticDashboard() {
   const openTabsSectionTitle = document.getElementById('openTabsSectionTitle');
 
   if (domainGroups.length > 0 && openTabsSection) {
-    if (openTabsSectionTitle) openTabsSectionTitle.textContent = 'Open tabs';
-    const dCount = domainGroups.length;
-    const tCount = filteredTabs.length;
-    openTabsSectionCount.textContent =
-      `${dCount} domain${dCount !== 1 ? 's' : ''} · ${tCount} tab${tCount !== 1 ? 's' : ''}`;
+    if (openTabsSectionTitle) {
+      if (activeFolderId) {
+        const af = folders.find(f => f.id === activeFolderId);
+        openTabsSectionTitle.textContent = af ? af.name : 'Folder';
+      } else {
+        openTabsSectionTitle.textContent = 'Open tabs';
+      }
+    }
+    if (activeFolderId) {
+      const folderGroups = domainGroups.filter(g => dfMap[g.domain] === activeFolderId);
+      const fTabs = folderGroups.reduce((n, g) => n + g.tabs.length, 0);
+      const fDomains = folderGroups.length;
+      openTabsSectionCount.textContent = fDomains > 0
+        ? `${fDomains} domain${fDomains !== 1 ? 's' : ''} · ${fTabs} tab${fTabs !== 1 ? 's' : ''}`
+        : '';
+    } else {
+      const dCount = domainGroups.length;
+      const tCount = filteredTabs.length;
+      openTabsSectionCount.textContent =
+        `${dCount} domain${dCount !== 1 ? 's' : ''} · ${tCount} tab${tCount !== 1 ? 's' : ''}`;
+    }
     const playFlip = flipDomainCards(openTabsMissionsEl);
     openTabsMissionsEl.innerHTML = renderOpenTabsWithFolders(folders, dfMap, domainFolderOrder);
     playFlip();
@@ -2351,7 +2387,6 @@ document.addEventListener('click', async (e) => {
       item.classList.add('removing');
       setTimeout(() => {
         item.remove();
-        renderDeferredColumn();
         renderStaticDashboard();
       }, 300);
     } else {
@@ -2745,16 +2780,15 @@ document.addEventListener('click', async (e) => {
     const fid = a.dataset.folderId || null;
     if (activeFolderId === fid) return;
     activeFolderId = fid;
-    await Promise.all([renderStaticDashboard(), renderDeferredColumn()]);
+    await renderStaticDashboard();
     return;
   }
 
   // ---- Create new folder from the folder bar ----
   if (act === 'new-folder-bar') {
     const folder = await createFolder('New Folder');
-    activeFolderId = folder.id;
     _folderManagePanelOpen = true;
-    await Promise.all([renderStaticDashboard(), renderDeferredColumn()]);
+    await renderStaticDashboard();
     // Start rename immediately in the manage panel
     const nameEl = document.querySelector(`.folder-manage-row[data-folder-id="${folder.id}"] .folder-manage-name`);
     if (nameEl) startFolderRename(nameEl, folder.id);
@@ -2773,15 +2807,11 @@ document.addEventListener('click', async (e) => {
 
   // ---- Create new folder (section-level button) ----
   if (act === 'new-folder') {
-    const section = a.dataset.section; // "open" or "saved"
     const folder = await createFolder('New Folder');
-    if (section === 'open') {
-      await renderStaticDashboard();
-    } else {
-      await renderDeferredColumn();
-    }
-    // Immediately start renaming it
-    const nameEl = document.querySelector(`[data-folder-id="${folder.id}"] .tab-folder-name, [data-saved-folder-id="${folder.id}"] .saved-folder-name`);
+    _folderManagePanelOpen = true;
+    await renderStaticDashboard();
+    // Rename immediately in the manage panel (always visible since panel is now open)
+    const nameEl = document.querySelector(`.folder-manage-row[data-folder-id="${folder.id}"] .folder-manage-name`);
     if (nameEl) startFolderRename(nameEl, folder.id);
     return;
   }
@@ -2824,7 +2854,7 @@ document.addEventListener('click', async (e) => {
     const folderId = a.dataset.folderId;
     if (activeFolderId === folderId) activeFolderId = null;
     await deleteFolder(folderId);
-    await Promise.all([renderStaticDashboard(), renderDeferredColumn()]);
+    await renderStaticDashboard();
     showToast('Folder deleted — items moved to unfiled');
     return;
   }
@@ -2834,7 +2864,7 @@ document.addEventListener('click', async (e) => {
     e.stopPropagation();
     const folderId = a.dataset.folderId;
     await moveFolderOrder(folderId, act === 'folder-up' ? 'up' : 'down');
-    await Promise.all([renderStaticDashboard(), renderDeferredColumn()]);
+    await renderStaticDashboard();
     return;
   }
 
@@ -2954,17 +2984,20 @@ function startFolderRename(nameEl, folderId) {
   input.focus();
   input.select();
 
+  let saved = false;
   async function save() {
+    if (saved) return;
+    saved = true;
     const newName = input.value.trim() || oldName;
     const folders = await getFolders();
     const f = folders.find(x => x.id === folderId);
     if (f) { f.name = newName; f.updatedAt = Date.now(); await saveFolders(folders); }
-    await Promise.all([renderStaticDashboard(), renderDeferredColumn()]);
+    await renderStaticDashboard();
   }
 
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter')  { e.preventDefault(); save(); }
-    if (e.key === 'Escape') { input.value = oldName; save(); }
+    if (e.key === 'Enter')  { e.preventDefault(); input.blur(); }
+    if (e.key === 'Escape') { input.value = oldName; input.blur(); }
   });
   input.addEventListener('blur', save);
 }

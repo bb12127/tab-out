@@ -1658,7 +1658,7 @@ img.workspace-btn-icon {
 .tab-folder-header-card:hover { background: rgba(154,145,138,0.06); }
 
 .tab-folder-chevron {
-  width: 12px; height: 12px;
+  width: 14px; height: 14px;
   color: var(--muted);
   transition: transform 0.2s;
   flex-shrink: 0;
@@ -1699,7 +1699,7 @@ img.workspace-btn-icon {
 }
 .tab-folder-btn:hover { background: rgba(154,145,138,0.15); color: var(--ink); }
 .tab-folder-btn.danger:hover { color: var(--status-abandoned); }
-.tab-folder-btn svg { width: 12px; height: 12px; }
+.tab-folder-btn svg { width: 14px; height: 14px; }
 
 /* Unfiled separator — also spans all columns */
 .tab-unfiled-sep {
@@ -1739,7 +1739,7 @@ img.workspace-btn-icon {
   display: inline-flex; align-items: center; font-size: 11px;
   font-family: 'DM Sans', sans-serif; gap: 3px;
 }
-.move-folder-btn svg { width: 12px; height: 12px; }
+.move-folder-btn svg { width: 14px; height: 14px; }
 .move-folder-btn:hover { opacity: 1; color: var(--accent-slate); }
 .move-folder-btn.in-folder { opacity: 0.9; color: var(--accent-slate); }
 
@@ -1770,7 +1770,7 @@ img.workspace-btn-icon {
 .saved-folder-header:hover { background: rgba(154,145,138,0.06); }
 
 .saved-folder-chevron {
-  width: 11px; height: 11px; color: var(--muted);
+  width: 13px; height: 13px; color: var(--muted);
   transition: transform 0.2s; flex-shrink: 0;
 }
 .saved-folder.collapsed .saved-folder-chevron { transform: rotate(-90deg); }
@@ -1805,7 +1805,7 @@ img.workspace-btn-icon {
 }
 .saved-folder-btn:hover { background: rgba(154,145,138,0.15); color: var(--ink); }
 .saved-folder-btn.danger:hover { color: var(--status-abandoned); }
-.saved-folder-btn svg { width: 11px; height: 11px; }
+.saved-folder-btn svg { width: 13px; height: 13px; }
 
 .saved-folder-body { padding: 2px 0 2px 4px; }
 .saved-folder.collapsed .saved-folder-body { display: none; }
@@ -1845,7 +1845,7 @@ img.workspace-btn-icon {
   transition: opacity 0.15s, color 0.15s;
   display: flex; align-items: center; flex-shrink: 0;
 }
-.item-folder-btn svg { width: 13px; height: 13px; }
+.item-folder-btn svg { width: 14px; height: 14px; }
 .item-folder-btn:hover { opacity: 1; color: var(--accent-slate); }
 .item-folder-btn.in-folder { opacity: 0.9; color: var(--accent-slate); }
 
@@ -1868,6 +1868,7 @@ img.workspace-btn-icon {
 }
 .folder-picker-item:hover { background: rgba(154,145,138,0.1); }
 .folder-picker-item.current { color: var(--accent-sage); font-weight: 600; }
+.folder-picker-item svg { width: 14px; height: 14px; flex-shrink: 0; }
 .folder-picker-sep { height: 1px; background: var(--warm-gray); margin: 3px 6px; }
 
 /* Drag-and-drop drop target */
@@ -1935,23 +1936,21 @@ mark.search-hit {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 13px;
+  padding: 5px 14px;
   border-radius: 20px;
   border: 1.5px solid var(--warm-gray);
   background: transparent;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 12.5px;
   font-family: 'DM Sans', sans-serif;
   cursor: pointer;
   white-space: nowrap;
-  transition: border-color 0.15s, color 0.15s, background 0.15s,
-              padding 0.2s ease, font-size 0.2s ease, box-shadow 0.2s ease;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
 }
 
 .folder-chip svg {
-  width: 14px; height: 14px;
+  width: 13px; height: 13px;
   flex-shrink: 0;
-  transition: width 0.2s, height 0.2s;
 }
 
 .folder-chip:hover {
@@ -1959,19 +1958,12 @@ mark.search-hit {
   color: var(--ink);
 }
 
-/* Active (selected) chip — noticeably bigger */
+/* Active (selected) chip — same size, just filled */
 .folder-chip.active {
   background: var(--ink);
   color: var(--paper);
   border-color: var(--ink);
-  padding: 9px 20px;
-  font-size: 14px;
   font-weight: 600;
-  box-shadow: 0 2px 10px rgba(0,0,0,0.25);
-}
-
-.folder-chip.active svg {
-  width: 17px; height: 17px;
 }
 
 /* "New folder" chip — dashed outline */
@@ -2140,16 +2132,73 @@ mark.search-hit {
 }
 
 /* ================================================================
-   FOLDER ICON SIZE FIXES — increase from the previous too-small sizes
+   FOLDER MANAGE PANEL — active-folder row highlight
    ================================================================ */
 
-.tab-folder-btn svg       { width: 15px !important; height: 15px !important; }
-.saved-folder-btn svg     { width: 14px !important; height: 14px !important; }
-.move-folder-btn svg      { width: 15px !important; height: 15px !important; }
-.item-folder-btn svg      { width: 15px !important; height: 15px !important; }
-.tab-folder-chevron       { width: 14px !important; height: 14px !important; }
-.saved-folder-chevron     { width: 13px !important; height: 13px !important; }
-.folder-picker-item svg   { width: 14px !important; height: 14px !important; }
+.folder-manage-row.is-active {
+  background: rgba(154,145,138,0.1);
+}
+.folder-manage-row.is-active .folder-manage-name {
+  font-weight: 600;
+}
+.folder-manage-row.is-active .folder-manage-icon {
+  color: var(--ink);
+}
+
+/* Folder focus header — shown inside content when a folder chip is active */
+.folder-focus-header {
+  column-span: all;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  break-inside: avoid;
+}
+
+.folder-focus-header-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.folder-focus-header-name svg {
+  width: 15px;
+  height: 15px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.folder-focus-clear {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+  font-family: 'DM Sans', sans-serif;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.folder-focus-clear:hover {
+  color: var(--ink);
+  background: rgba(154,145,138,0.1);
+}
+
+.folder-focus-clear svg {
+  width: 11px;
+  height: 11px;
+}
+
+.folder-focus-spacer {
+  flex: 1;
+}
 
 /* ---- Dark Mode ---- */
 :root {
