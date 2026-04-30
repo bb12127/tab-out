@@ -1,215 +1,126 @@
 ================================================================
-TAB OUT — REFACTOR HANDOFF
+TAB OUT — HANDOFF NOTES
+Branch: feat/folders-integrated  →  bb12127/tab-out:main (PR #5)
+Last updated: 2026-04-30
 ================================================================
 
-Date: 2026-04-28
-Scope: Split extension/app.js (was 2,532 lines) into focused ES
-       modules. Behavior-preserving — no features added or removed.
+WHAT THIS BRANCH SHIPS
+----------------------
+A coherent UI/UX pass on top of the split-module architecture (main).
+Folders, search, drag-and-drop, stable refresh, and a redesigned
+duplicate-cleanup affordance.
 
 
-----------------------------------------------------------------
-1. WHAT CHANGED
-----------------------------------------------------------------
-
-extension/app.js was a single monolithic file. It is now an
-orchestrator (1,155 lines) that imports from six new helper
-modules.
-
-Files added (all in extension/):
-  - format.js         pure string / domain / date helpers
-  - effects.js        Web Audio swoosh, confetti, FLIP, toast,
-                      empty-state, animateCardOut
-  - storage.js        chrome.storage.local CRUD for deferred tabs,
-                      saved groups, workspace icons + the workspace
-                      name migration helper
-  - tabs.js           chrome.tabs / chrome.windows wrappers; owns
-                      the openTabs snapshot privately and exposes
-                      it via getOpenTabs()
-  - render.js         pure HTML string builders + ICONS const +
-                      buildLiveWorkspaceMap (now takes openTabs as
-                      an argument instead of closing over a global)
-  - icon-picker.js    workspace emoji picker popover +
-                      EMOJI_CATEGORIES const
-
-Files modified:
-  - app.js            slimmed to render orchestration + click
-                      handler + live tab sync + init. Imports from
-                      all six helpers above.
-  - index.html        the script tag for app.js was changed to
-                      type="module" during the refactor, then later
-                      reverted in your working copy. See section 3
-                      below — this MUST be type="module" for the
-                      refactored code to load.
-
-Files NOT modified:
-  - background.js     service worker, untouched
-  - manifest.json     unchanged (MV3 page contexts already support
-                      ES modules; no manifest tweak needed)
-  - style.css         unchanged
-  - config.local.js   unchanged (still empty, still gitignored)
+FILES TOUCHED
+-------------
+  extension/index.html   — search bar, folder bar, removed redundant button
+  extension/app.js       — folder state, drag-and-drop, stable order, refresh debounce
+  extension/render.js    — folder SVGs, escHtml, drag handles, dupe affordances
+  extension/style.css    — drag feedback, dupe pill styles, layout fixes
 
 
-----------------------------------------------------------------
-2. DEPENDENCY GRAPH
-----------------------------------------------------------------
+KEY CHANGES BY AREA
+-------------------
 
-  format.js, effects.js, icon-picker.js, tabs.js   (no imports)
-                |
-                v
-  storage.js  -> format.js  (uses friendlyDomain in saveGroupForLater)
-  render.js   -> format.js  (uses cleanTitle, smartTitle, timeAgo, etc.)
-                |
-                v
-  app.js      -> tabs, storage, format, effects, render, icon-picker
+1. FOLDERS
+   - storage.js exports folder CRUD: getFolders, createFolder, deleteFolder,
+     moveFolderOrder, setDomainFolder, setDeferredFolder, saveFolders.
+   - Data lives under three keys: 'folders', 'domainFolderMap',
+     'domainFolderOrder' ('__root__' is the unfiled bucket).
+   - Folder bar (#folderBar) shows chips: All, <each folder>, +New folder, Manage.
+   - Visible only when there are open tabs. Empty state shows a
+     "drop here or click +" hint.
+   - Manage panel (#folderManagePanel) has rename / delete / reorder.
 
-No cycles. Acyclic and bottom-up — leaf modules can be replaced
-or unit-tested in isolation.
+2. DRAG-AND-DROP
+   - Domain cards and saved items both have draggable=true plus a small
+     drag handle (.card-drag-handle / .item-drag-handle).
+   - Drop targets:
+       * folder chips on the bar  -> move to that folder (or "All" = unfile)
+       * folder bar empty placeholder -> auto-creates a folder + assigns
+       * folder header in Open tabs / Saved -> move to folder
+       * another card / item -> reorder within the bucket (insertion line shows)
+   - Visual feedback:
+       .dragging   -> 0.4 opacity on the source
+       .drop-target-> amber dashed outline on folder targets
+       .drop-before/.drop-after -> 3px amber bar at the insertion edge
+   - Up/down arrow buttons removed (drag replaces them).
 
+3. STABLE REFRESH (no more jumping cards)
+   - _stableDomainOrder preserves card positions across re-renders.
+     New domains are appended; removed domains drop out. No tab-count sort
+     after first paint.
+   - scheduleDashboardRefresh:
+       * 600 ms debounce (collapses bursts of tab events)
+       * skipped while user is dragging (.dragging selector exists)
+       * onUpdated only triggers on URL/title changes, not status pings
+   - FLIP animation in effects.js still smooths any movement.
 
-----------------------------------------------------------------
-3. PENDING STEP — index.html
-----------------------------------------------------------------
+4. DUPLICATE CLEANUP — REFRAME
+   The previous "Close N duplicates" button looked like a peer of
+   Save/Archive/Close (red X). Reframed to two complementary affordances:
+     - PER-URL: each chip with duplicates shows a clickable amber pill
+       at the RIGHT edge of the chip (after the close X): "x 2x".
+       Click it -> that URL's extras close, one stays. Action sits right
+       next to the indicator that announced the problem.
+     - BULK: when duplicates span >= 2 different URLs, a small SOLID amber
+       pill appears in the card header: "Clean up N". Solid background
+       differentiates it from the neutral "N tabs open" status pill.
+   Single-URL dupes intentionally don't show the bulk button — the per-row
+   pill is enough.
 
-For the refactored code to run, line 132 of extension/index.html
-needs the type="module" attribute:
-
-    <script type="module" src="app.js"></script>
-
-The current value (<script src="app.js">) will fail at load time
-because app.js now uses `import` statements at the top — those are
-syntax errors in a non-module script context.
-
-When you open the new tab page in Chrome with the current
-index.html, you'll see a SyntaxError in DevTools Console:
-  "Cannot use import statement outside a module"
-
-Fix: add type="module" to the script tag. Nothing else needs to
-change. Module scripts have implicit defer semantics so loading
-order with the DOM is identical to the previous behavior.
-
-
-----------------------------------------------------------------
-4. ONE BEHAVIORAL TWEAK (NOT A REGRESSION)
-----------------------------------------------------------------
-
-buildLiveWorkspaceMap() previously closed over the module-level
-`openTabs` global. It now takes openTabs as its first argument
-because it lives in render.js and openTabs lives in tabs.js.
-
-Both call sites in app.js were updated to pass getOpenTabs():
-  - renderDeferredColumn() in app.js
-  - the archive-search input handler in app.js
-
-This is functionally identical — getOpenTabs() returns the same
-array reference each render — but be aware if you grep for
-"buildLiveWorkspaceMap" later.
-
-
-----------------------------------------------------------------
-5. EXPLICITLY OUT OF SCOPE
-----------------------------------------------------------------
-
-The following were considered and intentionally left for follow-up
-sessions if you want them. They are NOT bugs in the current state.
-
-  - The 600-line click handler in app.js was kept whole. Splitting
-    it into per-action handlers is a separate refactor.
-  - No state-manager pattern, no observer pattern, no event bus.
-    domainGroups and activeWorkspace are still let-bindings in
-    app.js, mutated directly by the click handler and reads in
-    renderStaticDashboard.
-  - No TypeScript, no build step, no bundler. Native ES modules.
-  - background.js was not touched.
-  - No tests were added (none existed before).
-  - No visual or behavioral changes.
+5. UI POLISH
+   - Search bar: capped max-width 520px (was full window).
+   - Folder bar: inline-flex; controls flow next to chips (was big gap).
+   - Action row in cards: flex-wrap + tighter padding so 3 buttons fit and
+     never clip on the 280px column.
+   - Removed redundant section-header "+ New folder" button (folder bar
+     already has it).
+   - Fixed CSS class-name mismatches (search bar, search icon, clear button)
+     that previously caused the icon to render at full SVG size.
 
 
-----------------------------------------------------------------
-6. VERIFICATION CHECKLIST
-----------------------------------------------------------------
-
-After fixing index.html line 132 (see section 3), reload the
-extension at chrome://extensions/ and open a new tab. Confirm:
-
-  [ ] Greeting + date render at top
-  [ ] Open tabs render as domain cards with favicons
-  [ ] Clicking a tab chip focuses that tab
-  [ ] Save for later on a single tab moves it to the right column
-  [ ] Save group on a domain card creates a saved group entry
-  [ ] Close all on a domain card plays swoosh + confetti, then
-      animates the card out
-  [ ] Close duplicates badge appears when a URL is open >1 time
-  [ ] Workspace filter pills appear (Opera GX, with >=2 workspaces)
-  [ ] Workspace emoji edit (pencil -> picker -> pick) persists
-      across reloads
-  [ ] Archive toggle expands; archive search filters items
-  [ ] Restore from archive moves item back to active saved
-  [ ] Reopen a saved group restores all tabs in original workspace
-  [ ] FLIP animation: close one card and watch the others slide
-  [ ] Empty state appears when all tabs are closed
-  [ ] Tab Out duplicate banner shows with multiple new-tab pages
-
-DevTools checks:
-  [ ] Console: no errors, no [tab-out] warnings
-  [ ] Network: all six new .js files load with status 200
-  [ ] Application -> Storage: deferred and workspaceIcons keys
-      are present with the same shape as before
+HOW TO TEST QUICKLY
+-------------------
+1. Reload the extension page (chrome://extensions -> reload Tab Out).
+2. Folders:
+     - Click "+ New folder" -> empty folder appears.
+     - Drag a domain card onto the folder chip -> card files into folder.
+     - Click the folder chip -> focused view shows only that folder's tabs.
+3. Drag-and-drop:
+     - Drag two cards on top of each other in the same folder/root -> reorder
+       (amber line shows insertion edge).
+     - Drag a saved item onto a folder header in the Saved column -> moves.
+4. Duplicate cleanup:
+     - Open the same URL twice -> "2x" pill appears at the right of its chip.
+     - Click the amber 2x pill -> extras close.
+     - Open >= 2 different URLs twice each -> header shows "Clean up N".
+5. Stable refresh:
+     - Open / close some tabs externally — cards should NOT reshuffle by
+       tab count. Movement only happens for added/removed domains.
 
 
-----------------------------------------------------------------
-7. WHERE THINGS LIVE NOW (QUICK INDEX)
-----------------------------------------------------------------
-
-If you want to find...
-
-  Tab close / focus / dedup logic    -> tabs.js
-  Saved tabs / groups CRUD           -> storage.js
-  Workspace name migration           -> storage.js (migrateWorkspaceNames)
-  Workspace icon get/set             -> storage.js
-  Greeting / date / friendly domain  -> format.js
-  Title cleanup (cleanTitle, etc.)   -> format.js
-  Swoosh sound                       -> effects.js (playCloseSound)
-  Confetti                           -> effects.js (shootConfetti)
-  FLIP animation                     -> effects.js (flipDomainCards)
-  Toast                              -> effects.js (showToast)
-  Empty-state message                -> effects.js (checkAndShowEmptyState)
-  Domain card HTML                   -> render.js (renderDomainCard)
-  Saved-for-later HTML               -> render.js (renderDeferredItem,
-                                                  renderDeferredGroup,
-                                                  renderArchiveItem,
-                                                  renderArchiveGroup)
-  Workspace badge HTML               -> render.js (buildGroupWorkspaceBadge)
-  Live workspace map                 -> render.js (buildLiveWorkspaceMap)
-  Emoji picker popover               -> icon-picker.js
-  Workspace filter bar HTML          -> app.js (inline in renderStaticDashboard)
-  Click handler / event delegation   -> app.js
-  Live tab sync (chrome.tabs events) -> app.js (scheduleDashboardRefresh)
-  Tab Out duplicate detection        -> app.js (closeTabOutDupes,
-                                                checkTabOutDupes)
+KNOWN FOLLOW-UPS / WATCH ITEMS
+------------------------------
+- storage.js still exports reorderDeferredItem (no longer called).
+  Harmless dead export; remove next time you touch storage.js.
+- _stableDomainOrder is in-memory only. After a full reload, the initial
+  paint sorts by tab count; subsequent renders are stable. If user-visible
+  flicker on first load becomes a complaint, persist this map to
+  chrome.storage.local under e.g. 'rootDomainOrder'.
+- The search bar filters open-tab cards and saved items. It does NOT
+  currently filter inside individual chips (chip rows). If users ask for
+  inline chip filtering, add a per-chip text-match in applySearch().
 
 
-----------------------------------------------------------------
-8. LINE COUNTS BEFORE / AFTER
-----------------------------------------------------------------
+PR / GIT
+--------
+- Repo:    bb12127/tab-out  (NOT upstream zarazhangrui/tab-out)
+- Base:    main
+- Head:    feat/folders-integrated
+- PR:      https://github.com/bb12127/tab-out/pull/5
 
-  Before:  app.js                     2,532 lines
-                                      ----- TOTAL: 2,532
-
-  After:   app.js                     1,155 lines  (-54%)
-           render.js                    452
-           storage.js                   299
-           effects.js                   236
-           format.js                    229
-           tabs.js                      198
-           icon-picker.js               100
-                                      ----- TOTAL: 2,669  (+5% net)
-
-The +5% net is import/export blocks, module headers, and one
-function whose signature changed (buildLiveWorkspaceMap now takes
-a parameter). Each individual file is small enough to hold in your
-head; the largest (render.js at 452) is mostly multi-line HTML
-template strings.
-
-================================================================
-END OF HANDOFF
-================================================================
+To resume work:
+  git fetch origin
+  git checkout feat/folders-integrated
+  git pull origin feat/folders-integrated

@@ -92,7 +92,9 @@ export function buildOverflowChips(hiddenTabs, urlCounts = {}) {
     try { tabHostname = new URL(tab.url).hostname; } catch {}
     const label    = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), tabHostname);
     const count    = urlCounts[tab.url] || 1;
-    const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
+    const dupeTag  = count > 1
+      ? ` <button class="chip-dupe-badge" data-action="dedup-this-url" data-tab-url="${(tab.url || '').replace(/"/g, '&quot;')}" title="Close ${count - 1} duplicate${count - 1 !== 1 ? 's' : ''} of this tab, keep one">${count}×</button>`
+      : '';
     const chipClass = count > 1 ? ' chip-has-dupes' : '';
     const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
     const safeTitle = label.replace(/"/g, '&quot;');
@@ -101,7 +103,7 @@ export function buildOverflowChips(hiddenTabs, urlCounts = {}) {
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
     return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="">` : ''}
-      <span class="chip-text">${label}</span>${dupeTag}
+      <span class="chip-text">${label}</span>
       <div class="chip-actions">
         <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
@@ -109,7 +111,7 @@ export function buildOverflowChips(hiddenTabs, urlCounts = {}) {
         <button class="chip-action chip-close" data-action="close-single-tab" data-tab-url="${safeUrl}" title="Close this tab">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
         </button>
-      </div>
+      </div>${dupeTag}
     </div>`;
   }).join('');
 
@@ -150,10 +152,16 @@ export function renderDomainCard(group, folderId = null, domainFolderMap = {}) {
     ${tabCount} tab${tabCount !== 1 ? 's' : ''} open
   </span>`;
 
-  const dupeBadge = hasDupes
-    ? `<span class="open-tabs-badge" style="color:var(--accent-amber);background:rgba(200,113,58,0.08);">
-        ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
-      </span>`
+  const dupeUrlsEncoded = hasDupes ? dupeUrls.map(([url]) => encodeURIComponent(url)).join(',') : '';
+  // Stacked-pages icon — visual hint for "merge duplicates"
+  const dupeIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16 5H8a2 2 0 0 0-2 2v10m12-9v10a2 2 0 0 1-2 2H6"/></svg>`;
+  // Header bulk-cleanup pill: only show when there are duplicates across multiple URLs
+  // (single-URL dupes are handled by clicking the (2×) chip badge directly).
+  const showBulkDupeBtn = hasDupes && dupeUrls.length >= 2;
+  const dupeBadge = showBulkDupeBtn
+    ? `<button class="dupe-bulk" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}" title="Close all ${totalExtras} duplicates, keep one of each URL">
+        ${dupeIcon}<span>Clean up ${totalExtras}</span>
+      </button>`
     : '';
 
   // Deduplicate for display: show each URL once, with (Nx) badge if duped
@@ -178,7 +186,9 @@ export function renderDomainCard(group, folderId = null, domainFolderMap = {}) {
       if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
     } catch {}
     const count    = urlCounts[tab.url];
-    const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
+    const dupeTag  = count > 1
+      ? ` <button class="chip-dupe-badge" data-action="dedup-this-url" data-tab-url="${(tab.url || '').replace(/"/g, '&quot;')}" title="Close ${count - 1} duplicate${count - 1 !== 1 ? 's' : ''} of this tab, keep one">${count}×</button>`
+      : '';
     const chipClass = count > 1 ? ' chip-has-dupes' : '';
     const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
     const safeTitle = label.replace(/"/g, '&quot;');
@@ -187,7 +197,7 @@ export function renderDomainCard(group, folderId = null, domainFolderMap = {}) {
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
     return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="">` : ''}
-      <span class="chip-text">${label}</span>${dupeTag}
+      <span class="chip-text">${label}</span>
       <div class="chip-actions">
         <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
@@ -195,7 +205,7 @@ export function renderDomainCard(group, folderId = null, domainFolderMap = {}) {
         <button class="chip-action chip-close" data-action="close-single-tab" data-tab-url="${safeUrl}" title="Close this tab">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
         </button>
-      </div>
+      </div>${dupeTag}
     </div>`;
   }).join('') + (extraCount > 0 ? buildOverflowChips(uniqueTabs.slice(8), urlCounts) : '');
 
@@ -215,33 +225,17 @@ export function renderDomainCard(group, folderId = null, domainFolderMap = {}) {
       Close all ${tabCount} tab${tabCount !== 1 ? 's' : ''}
     </button>`;
 
-  if (hasDupes) {
-    const dupeUrlsEncoded = dupeUrls.map(([url]) => encodeURIComponent(url)).join(',');
-    actionsHtml += `
-      <button class="action-btn" data-action="dedup-keep-one" data-dupe-urls="${dupeUrlsEncoded}">
-        Close ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
-      </button>`;
-  }
-
-  // Folder row — move-to-folder button + card reorder buttons
+  // Folder row — drag handle + move-to-folder button
   const currentFolderId = folderId || null;
   const folderBtnClass  = currentFolderId ? ' in-folder' : '';
-  const upSvg   = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 15.75 7.5-7.5 7.5 7.5"/></svg>`;
-  const downSvg = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>`;
+  const dragHandleSvg   = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9h16.5m-16.5 6.75h16.5"/></svg>`;
 
   const folderRow = `
-    <div style="display:flex;align-items:center;gap:4px;margin-top:8px">
+    <div class="card-folder-row">
+      <span class="card-drag-handle" title="Drag to reorder or move to a folder">${dragHandleSvg}</span>
       <button class="move-folder-btn${folderBtnClass}" data-action="move-domain-to-folder"
         data-domain="${group.domain}" data-current-folder="${escHtml(currentFolderId || '')}"
         title="Move to folder">${FOLDER_SVG}</button>
-      <div class="card-reorder-btns">
-        <button class="card-reorder-btn" data-action="domain-up"
-          data-domain="${group.domain}" data-folder-id="${escHtml(currentFolderId || '')}"
-          title="Move card up">${upSvg}</button>
-        <button class="card-reorder-btn" data-action="domain-down"
-          data-domain="${group.domain}" data-folder-id="${escHtml(currentFolderId || '')}"
-          title="Move card down">${downSvg}</button>
-      </div>
     </div>`;
 
   return `
@@ -286,16 +280,10 @@ export function renderDeferredItem(item) {
   const changedAgo = item.updatedAt ? timeAgo(item.updatedAt) : null;
   const folderCls  = item.folderId ? ' in-folder' : '';
 
+  const dragHandleSvg = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9h16.5m-16.5 6.75h16.5"/></svg>`;
   return `
     <div class="deferred-item" data-deferred-id="${item.id}" draggable="true">
-      <div class="reorder-btns">
-        <button class="reorder-btn" data-action="deferred-up" data-deferred-id="${item.id}" title="Move up">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 15.75 7.5-7.5 7.5 7.5"/></svg>
-        </button>
-        <button class="reorder-btn" data-action="deferred-down" data-deferred-id="${item.id}" title="Move down">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>
-        </button>
-      </div>
+      <span class="item-drag-handle" title="Drag to reorder or move to a folder">${dragHandleSvg}</span>
       <div class="deferred-info">
         <a href="${item.url}" target="_blank" rel="noopener" class="deferred-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
           <img src="${faviconUrl}" alt="" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px">${item.title || item.url}
@@ -431,17 +419,11 @@ export function renderDeferredGroup(group, storedIcons = {}, liveWorkspaces = ne
   const folderCls  = group.folderId ? ' in-folder' : '';
   const changedAgo = group.updatedAt ? timeAgo(group.updatedAt) : null;
 
+  const dragHandleSvg = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9h16.5m-16.5 6.75h16.5"/></svg>`;
   return `
     <div class="deferred-group" data-group-id="${group.id}" draggable="true">
       <div class="group-header">
-        <div class="reorder-btns">
-          <button class="reorder-btn" data-action="deferred-up" data-deferred-id="${group.id}" title="Move up">
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 15.75 7.5-7.5 7.5 7.5"/></svg>
-          </button>
-          <button class="reorder-btn" data-action="deferred-down" data-deferred-id="${group.id}" title="Move down">
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>
-          </button>
-        </div>
+        <span class="item-drag-handle" title="Drag to reorder or move to a folder">${dragHandleSvg}</span>
         <button class="group-toggle" data-action="toggle-group" data-group-id="${group.id}" title="Expand/collapse">
           <svg class="group-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>
         </button>

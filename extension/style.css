@@ -342,6 +342,27 @@ header {
   height: 10px;
 }
 
+/* Header BULK cleanup pill — only shown when duplicates span ≥2 URLs.
+   Solid amber tint with merge icon so it's unambiguously an action button.
+   Visually different from the neutral filled "N tabs open" status pill. */
+.dupe-bulk {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  font-family: 'DM Sans', sans-serif;
+  color: var(--paper);
+  background: var(--accent-amber);
+  border: none;
+  padding: 3px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+}
+.dupe-bulk svg { width: 11px; height: 11px; }
+.dupe-bulk:hover { opacity: 0.88; transform: translateY(-1px); }
+
 .mission-summary {
   font-size: 13px;
   color: var(--muted);
@@ -396,9 +417,32 @@ header {
 }
 
 /* Duplicate badge */
-.chip-dupe-badge {
+/* (2×) badge on a duplicate chip — clickable: closes the extras of THAT URL.
+   Amber pill, hover lifts to make the action obvious. */
+button.chip-dupe-badge {
+  background: rgba(200,113,58,0.12);
+  border: 1px solid rgba(200,113,58,0.35);
   color: var(--accent-amber);
   font-weight: 600;
+  font-size: 10px;
+  font-family: 'DM Sans', sans-serif;
+  line-height: 1;
+  padding: 2px 6px;
+  margin-left: 4px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+  flex-shrink: 0;
+}
+button.chip-dupe-badge:hover {
+  background: rgba(200,113,58,0.28);
+  border-color: var(--accent-amber);
+  transform: scale(1.05);
+}
+button.chip-dupe-badge::before {
+  content: '×';
+  margin-right: 2px;
+  opacity: 0.7;
 }
 
 /* Duplicate border highlight */
@@ -493,7 +537,8 @@ header {
 /* ---- Actions row ---- */
 .actions {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px;
   margin-top: 10px;
 }
 
@@ -501,13 +546,20 @@ header {
   font-size: 11px;
   font-family: 'DM Sans', sans-serif;
   font-weight: 500;
-  padding: 5px 14px;
+  padding: 5px 10px;
   border-radius: 4px;
   border: 1px solid var(--warm-gray);
   background: var(--card-bg);
   color: var(--muted);
   cursor: pointer;
   transition: all 0.2s;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -1743,21 +1795,6 @@ img.workspace-btn-icon {
 .move-folder-btn:hover { opacity: 1; color: var(--accent-slate); }
 .move-folder-btn.in-folder { opacity: 0.9; color: var(--accent-slate); }
 
-/* Domain card reorder buttons */
-.card-reorder-btns {
-  display: flex; gap: 2px;
-  opacity: 0; transition: opacity 0.15s;
-}
-.mission-card:hover .card-reorder-btns { opacity: 0.55; }
-.card-reorder-btn {
-  background: none; border: none; cursor: pointer;
-  color: var(--muted); padding: 3px 2px; border-radius: 3px;
-  display: flex; align-items: center; transition: color 0.1s;
-  font-size: 10px;
-}
-.card-reorder-btn:hover { color: var(--ink); }
-.card-reorder-btn svg { width: 11px; height: 11px; }
-
 /* Saved-column folder wrapper */
 .saved-folder { margin-bottom: 8px; }
 
@@ -1822,22 +1859,6 @@ img.workspace-btn-icon {
 }
 .saved-unfiled-line { flex: 1; height: 1px; background: var(--warm-gray); }
 
-/* Reorder up/down on saved items */
-.reorder-btns {
-  display: flex; flex-direction: column; gap: 0;
-  opacity: 0; transition: opacity 0.15s; flex-shrink: 0;
-}
-.deferred-item:hover .reorder-btns { opacity: 0.5; }
-.deferred-group:hover > .group-header .reorder-btns { opacity: 0.5; }
-
-.reorder-btn {
-  background: none; border: none; cursor: pointer;
-  color: var(--muted); padding: 1px 2px;
-  display: flex; align-items: center; transition: color 0.1s;
-}
-.reorder-btn:hover { color: var(--ink); }
-.reorder-btn svg { width: 10px; height: 10px; }
-
 /* Move-to-folder button on saved items */
 .item-folder-btn {
   background: none; border: none; cursor: pointer;
@@ -1871,16 +1892,88 @@ img.workspace-btn-icon {
 .folder-picker-item svg { width: 14px; height: 14px; flex-shrink: 0; }
 .folder-picker-sep { height: 1px; background: var(--warm-gray); margin: 3px 6px; }
 
-/* Drag-and-drop drop target */
-.drop-target { outline: 2px dashed var(--accent-amber); outline-offset: 3px; border-radius: 8px; }
+/* ================================================================
+   DRAG-AND-DROP FEEDBACK
+   ================================================================ */
+
+/* Element being dragged — fade it so the cursor shows the destination */
+.dragging {
+  opacity: 0.4;
+  transform: scale(0.98);
+  transition: opacity 0.12s, transform 0.12s;
+}
+
+/* Hovering over a folder/header → glow as a drop target */
+.drop-target {
+  outline: 2px dashed var(--accent-amber);
+  outline-offset: 3px;
+  border-radius: 8px;
+  background: rgba(200,113,58,0.06);
+  transition: background 0.12s, outline-color 0.12s;
+}
+.folder-chip.drop-target,
+.folder-bar-empty.drop-target {
+  outline: 2px solid var(--accent-amber);
+  outline-offset: 2px;
+}
+
+/* Insertion line when reordering cards/items — pure box-shadow so we don't
+   collide with the .mission-card::before status bar */
+.drop-before { box-shadow: 0 -3px 0 0 var(--accent-amber); }
+.drop-after  { box-shadow: 0  3px 0 0 var(--accent-amber); }
+.deferred-item, .deferred-group { position: relative; }
+
+/* Empty-folder-bar placeholder shown when no folders exist yet */
+.folder-bar-empty {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  color: var(--muted);
+  font-style: italic;
+  padding: 5px 10px;
+  border-radius: 20px;
+  border: 1.5px dashed transparent;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
+}
+
+/* Drag handles — appear in card folder-row and saved item rows */
+.card-folder-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+.card-drag-handle,
+.item-drag-handle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  cursor: grab;
+  opacity: 0.35;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: opacity 0.12s, background 0.12s;
+  user-select: none;
+  -webkit-user-drag: element;
+}
+.card-drag-handle svg,
+.item-drag-handle svg { width: 14px; height: 14px; }
+.mission-card:hover .card-drag-handle,
+.deferred-item:hover .item-drag-handle,
+.deferred-group:hover .item-drag-handle { opacity: 0.85; }
+.card-drag-handle:active,
+.item-drag-handle:active { cursor: grabbing; }
 
 /* ================================================================
    SEARCH BAR
    ================================================================ */
 .search-bar-wrap {
-  position: relative; margin-bottom: 28px;
+  position: relative;
+  margin-bottom: 18px;
+  max-width: 520px;
 }
-.search-bar {
+#searchBar {
   width: 100%;
   padding: 10px 36px 10px 38px;
   font-family: 'DM Sans', sans-serif; font-size: 13px;
@@ -1888,18 +1981,19 @@ img.workspace-btn-icon {
   border: 1px solid var(--warm-gray); border-radius: 8px;
   color: var(--ink); outline: none;
   transition: border-color 0.2s;
+  box-sizing: border-box;
 }
-.search-bar:focus { border-color: var(--accent-amber); }
-.search-bar::placeholder { color: var(--muted); }
+#searchBar:focus { border-color: var(--accent-amber); }
+#searchBar::placeholder { color: var(--muted); }
 
-.search-bar-icon {
+.search-bar-wrap .search-icon {
   position: absolute; left: 12px; top: 50%;
+  width: 15px; height: 15px;
   transform: translateY(-50%);
-  color: var(--muted); pointer-events: none; display: flex;
+  color: var(--muted); pointer-events: none;
 }
-.search-bar-icon svg { width: 15px; height: 15px; }
 
-.search-clear-btn {
+#searchClearBtn {
   position: absolute; right: 10px; top: 50%;
   transform: translateY(-50%);
   background: none; border: none; cursor: pointer;
@@ -1907,9 +2001,9 @@ img.workspace-btn-icon {
   display: none; align-items: center;
   transition: color 0.15s;
 }
-.search-bar-wrap.has-query .search-clear-btn { display: flex; }
-.search-clear-btn:hover { color: var(--ink); }
-.search-clear-btn svg { width: 12px; height: 12px; }
+.search-bar-wrap.has-query #searchClearBtn { display: flex; }
+#searchClearBtn:hover { color: var(--ink); }
+#searchClearBtn svg { width: 12px; height: 12px; }
 
 mark.search-hit {
   background: rgba(200,113,58,0.18); color: inherit;
@@ -1925,10 +2019,11 @@ mark.search-hit {
 }
 
 .folder-bar {
-  display: flex;
+  display: inline-flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 7px;
+  max-width: 100%;
 }
 
 /* Base chip */

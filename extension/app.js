@@ -52,7 +52,6 @@ import {
   moveFolderOrder,
   setDomainFolder,
   setDeferredFolder,
-  reorderDeferredItem,
 } from './storage.js';
 
 import { friendlyDomain, getGreeting, getDateDisplay, timeAgo } from './format.js';
@@ -104,6 +103,11 @@ let _folderManagePanelOpen = false;
 // Last-loaded domain→folder map; kept in sync so reorderDomainCard can use it
 let _domainFolderMap = {};
 
+// Stable domain card ordering — preserves card positions across tab events.
+// New domains are appended; removed domains drop out. Only sorts by tab count
+// on first paint or after explicit user reorder.
+let _stableDomainOrder = [];
+
 
 /* ----------------------------------------------------------------
    TAB OUT DUPLICATE DETECTION
@@ -152,28 +156,6 @@ function checkTabOutDupes() {
    read/write module-level state (activeFolderId, domainGroups,
    _domainFolderMap) or mutate the DOM directly.
    ---------------------------------------------------------------- */
-
-/**
- * reorderDomainCard(domain, dir, folderId)
- *
- * Persists a card reorder within a folder bucket (or root bucket).
- * Uses domainGroups module state to know the current in-folder order.
- */
-async function reorderDomainCard(domain, dir, folderId) {
-  const { domainFolderOrder = {} } = await chrome.storage.local.get('domainFolderOrder');
-  const key      = folderId || '__root__';
-  const inFolder = domainGroups
-    .filter(g => (_domainFolderMap[g.domain] || null) === (folderId || null))
-    .map(g => g.domain);
-  let order = (domainFolderOrder[key] || []).filter(d => inFolder.includes(d));
-  inFolder.forEach(d => { if (!order.includes(d)) order.push(d); });
-  const i = order.indexOf(domain);
-  const j = dir === 'up' ? i - 1 : i + 1;
-  if (i < 0 || j < 0 || j >= order.length) return;
-  [order[i], order[j]] = [order[j], order[i]];
-  domainFolderOrder[key] = order;
-  await chrome.storage.local.set({ domainFolderOrder });
-}
 
 /**
  * renderOpenTabsWithFolders(folders, dfMap, domainFolderOrder)
@@ -252,25 +234,27 @@ function renderFolderBar(folders) {
   const bar  = document.getElementById('folderBar');
   if (!bar || !wrap) return;
 
-  if (folders.length === 0) {
-    wrap.style.display = 'none';
-    return;
-  }
-
   wrap.style.display = 'block';
 
-  const allActive = !activeFolderId ? ' active' : '';
-  const ALL_SVG = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25A2.25 2.25 0 0 1 13.5 18v-2.25Z"/></svg>`;
-  let html = `<button class="folder-chip${allActive}" data-action="filter-folder" data-folder-id="">${ALL_SVG}All</button>`;
+  let html = '';
 
-  for (const f of folders) {
-    const isActive = activeFolderId === f.id;
-    html += `<button class="folder-chip${isActive ? ' active' : ''}" data-action="filter-folder" data-folder-id="${escHtml(f.id)}">${FOLDER_SVG}<span class="folder-chip-name">${escHtml(f.name)}</span></button>`;
+  if (folders.length > 0) {
+    const allActive = !activeFolderId ? ' active' : '';
+    const ALL_SVG = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25A2.25 2.25 0 0 1 13.5 18v-2.25Z"/></svg>`;
+    html += `<button class="folder-chip${allActive}" data-action="filter-folder" data-folder-id="">${ALL_SVG}All</button>`;
+
+    for (const f of folders) {
+      const isActive = activeFolderId === f.id;
+      html += `<button class="folder-chip${isActive ? ' active' : ''}" data-action="filter-folder" data-folder-id="${escHtml(f.id)}" data-folder-drop="1">${FOLDER_SVG}<span class="folder-chip-name">${escHtml(f.name)}</span></button>`;
+    }
+  } else {
+    html += `<span class="folder-bar-empty">No folders yet — drop a card here or click +</span>`;
   }
 
-  html += `<span class="folder-bar-spacer"></span>`;
   html += `<button class="folder-chip-new" data-action="new-folder-bar" title="Create new folder">${ADD_FOLDER_SVG}New folder</button>`;
-  html += `<button class="folder-manage-toggle${_folderManagePanelOpen ? ' open' : ''}" data-action="toggle-folder-manage" title="Manage folders">${GEAR_SVG}Manage</button>`;
+  if (folders.length > 0) {
+    html += `<button class="folder-manage-toggle${_folderManagePanelOpen ? ' open' : ''}" data-action="toggle-folder-manage" title="Manage folders">${GEAR_SVG}Manage</button>`;
+  }
 
   bar.innerHTML = html;
 }
@@ -564,11 +548,29 @@ async function renderStaticDashboard() {
     }
   }
 
-  // Sort by tab count desc; alphabetical tiebreaker for stable order
-  domainGroups = Object.values(groupMap).sort((a, b) => {
-    const diff = b.tabs.length - a.tabs.length;
-    return diff !== 0 ? diff : a.domain.localeCompare(b.domain);
-  });
+  // STABLE ORDERING: preserve previous card positions across re-renders so
+  // tab events don't shuffle cards. New domains are sorted by tab count
+  // (desc) and appended after the already-known ones.
+  const allGroups = Object.values(groupMap);
+  const known     = new Set(_stableDomainOrder);
+  const present   = new Set(allGroups.map(g => g.domain));
+
+  // Drop any previously-known domains that no longer exist
+  _stableDomainOrder = _stableDomainOrder.filter(d => present.has(d));
+
+  // Append new domains, sorted by tab count desc (then alphabetical)
+  const newDomains = allGroups
+    .filter(g => !known.has(g.domain))
+    .sort((a, b) => {
+      const diff = b.tabs.length - a.tabs.length;
+      return diff !== 0 ? diff : a.domain.localeCompare(b.domain);
+    })
+    .map(g => g.domain);
+  _stableDomainOrder.push(...newDomains);
+
+  // Build domainGroups in the stable order
+  const byDomain = new Map(allGroups.map(g => [g.domain, g]));
+  domainGroups   = _stableDomainOrder.map(d => byDomain.get(d)).filter(Boolean);
 
   // --- Load folder data ---
   const [folders, dfMapRaw, { domainFolderOrder = {} }] = await Promise.all([
@@ -579,9 +581,15 @@ async function renderStaticDashboard() {
   const dfMap = dfMapRaw.domainFolderMap || {};
   _domainFolderMap = dfMap;
 
-  // Render folder bar + management panel
-  renderFolderBar(folders);
-  renderFolderManagePanel(folders);
+  // Render folder bar + management panel — hide when there are no open tabs
+  // (no surface to organise yet)
+  const folderBarWrap = document.getElementById('folderBarWrap');
+  if (domainGroups.length === 0) {
+    if (folderBarWrap) folderBarWrap.style.display = 'none';
+  } else {
+    renderFolderBar(folders);
+    renderFolderManagePanel(folders);
+  }
 
   // --- Render domain cards ---
   const openTabsSection      = document.getElementById('openTabsSection');
@@ -1177,6 +1185,23 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
+  // ---- Close duplicates of a single URL (per-chip (2×) badge) ----
+  if (action === 'dedup-this-url') {
+    e.stopPropagation();
+    const tabUrl = actionEl.dataset.tabUrl;
+    if (!tabUrl) return;
+    suppressAutoRefresh();
+    await closeDuplicateTabs([tabUrl], true);
+    playCloseSound();
+    actionEl.style.transition = 'opacity 0.2s, transform 0.2s';
+    actionEl.style.opacity    = '0';
+    actionEl.style.transform  = 'scale(0.8)';
+    setTimeout(() => actionEl.remove(), 200);
+    showToast('Closed duplicates, kept one copy');
+    scheduleDashboardRefresh(800);
+    return;
+  }
+
   // ---- Close duplicates, keep one copy ----
   if (action === 'dedup-keep-one') {
     const urlsEncoded = actionEl.dataset.dupeUrls || '';
@@ -1424,24 +1449,6 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
-  // ---- Reorder saved item up / down ----
-  if (act === 'deferred-up' || act === 'deferred-down') {
-    e.stopPropagation();
-    const itemId = a.dataset.deferredId;
-    await reorderDeferredItem(itemId, act === 'deferred-up' ? 'up' : 'down');
-    await renderDeferredColumn();
-    return;
-  }
-
-  // ---- Reorder domain card up / down ----
-  if (act === 'domain-up' || act === 'domain-down') {
-    e.stopPropagation();
-    const domain   = a.dataset.domain;
-    const folderId = a.dataset.folderId || null;
-    await reorderDomainCard(domain, act === 'domain-up' ? 'up' : 'down', folderId || null);
-    await renderStaticDashboard();
-    return;
-  }
 });
 
 // ---- Folder picker: close on outside click ----
@@ -1542,56 +1549,209 @@ function startFolderRename(nameEl, folderId) {
    ---------------------------------------------------------------- */
 
 (function initDragAndDrop() {
+  let _dragPayload = null;
+  const clearDropMarkers = () => {
+    document.querySelectorAll('.drop-target, .drop-before, .drop-after')
+      .forEach(el => el.classList.remove('drop-target', 'drop-before', 'drop-after'));
+  };
+
   document.addEventListener('dragstart', (e) => {
+    // Don't start drag from interactive children (buttons, links, chips)
+    if (e.target.closest('button, a, input, .page-chip')) {
+      e.preventDefault();
+      return;
+    }
     const card = e.target.closest('.mission-card[data-domain]');
     if (card) {
-      e.dataTransfer.setData('text/plain', JSON.stringify({ type: 'domain', domain: card.dataset.domain }));
+      _dragPayload = { type: 'domain', domain: card.dataset.domain, folderId: card.dataset.folderId || null };
+      e.dataTransfer.setData('text/plain', JSON.stringify(_dragPayload));
       e.dataTransfer.effectAllowed = 'move';
+      card.classList.add('dragging');
       return;
     }
     const item = e.target.closest('.deferred-item[data-deferred-id], .deferred-group[data-group-id]');
     if (item) {
       const id = item.dataset.deferredId || item.dataset.groupId;
-      e.dataTransfer.setData('text/plain', JSON.stringify({ type: 'deferred', id }));
+      _dragPayload = { type: 'deferred', id };
+      e.dataTransfer.setData('text/plain', JSON.stringify(_dragPayload));
       e.dataTransfer.effectAllowed = 'move';
+      item.classList.add('dragging');
     }
   });
 
+  document.addEventListener('dragend', () => {
+    _dragPayload = null;
+    clearDropMarkers();
+    document.querySelectorAll('.dragging').forEach(el => el.classList.remove('dragging'));
+  });
+
   document.addEventListener('dragover', (e) => {
-    const tabHeader   = e.target.closest('.tab-folder-header-card');
-    const savedHeader = e.target.closest('.saved-folder-header');
-    const target = tabHeader || savedHeader;
-    if (!target) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    target.classList.add('drop-target');
+    if (!_dragPayload) return;
+    clearDropMarkers();
+
+    // 1) Folder chip / folder header / "All" chip → move to folder
+    const folderChip   = e.target.closest('.folder-chip[data-folder-id], .folder-bar-empty');
+    const tabHeader    = e.target.closest('.tab-folder-header-card');
+    const savedHeader  = e.target.closest('.saved-folder-header');
+    const folderTarget = folderChip || tabHeader || savedHeader;
+    if (folderTarget) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      folderTarget.classList.add('drop-target');
+      return;
+    }
+
+    // 2) Hover over another card / saved item → reorder
+    if (_dragPayload.type === 'domain') {
+      const overCard = e.target.closest('.mission-card[data-domain]');
+      if (overCard && overCard.dataset.domain !== _dragPayload.domain) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        const r = overCard.getBoundingClientRect();
+        const before = (e.clientY - r.top) < r.height / 2;
+        overCard.classList.add(before ? 'drop-before' : 'drop-after');
+      }
+    } else if (_dragPayload.type === 'deferred') {
+      const overItem = e.target.closest('.deferred-item[data-deferred-id], .deferred-group[data-group-id]');
+      if (overItem) {
+        const overId = overItem.dataset.deferredId || overItem.dataset.groupId;
+        if (overId !== _dragPayload.id) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          const r = overItem.getBoundingClientRect();
+          const before = (e.clientY - r.top) < r.height / 2;
+          overItem.classList.add(before ? 'drop-before' : 'drop-after');
+        }
+      }
+    }
   });
 
   document.addEventListener('dragleave', (e) => {
-    const target = e.target.closest('.tab-folder-header-card, .saved-folder-header');
-    if (target) target.classList.remove('drop-target');
+    const target = e.target.closest(
+      '.tab-folder-header-card, .saved-folder-header, .folder-chip, .folder-bar-empty, .mission-card, .deferred-item, .deferred-group'
+    );
+    if (target) target.classList.remove('drop-target', 'drop-before', 'drop-after');
   });
 
   document.addEventListener('drop', async (e) => {
-    const tabHeader   = e.target.closest('.tab-folder-header-card');
-    const savedHeader = e.target.closest('.saved-folder-header');
-    const target = tabHeader || savedHeader;
-    if (!target) return;
-    target.classList.remove('drop-target');
-    e.preventDefault();
-    try {
-      const data = JSON.parse(e.dataTransfer.getData('text/plain'));
-      const folderId = target.dataset.folderId;
-      if (data.type === 'domain' && tabHeader) {
-        await setDomainFolder(data.domain, folderId);
+    if (!_dragPayload) return;
+    const data = _dragPayload;
+    _dragPayload = null;
+
+    const folderChip   = e.target.closest('.folder-chip[data-folder-id]');
+    const folderEmpty  = e.target.closest('.folder-bar-empty');
+    const tabHeader    = e.target.closest('.tab-folder-header-card');
+    const savedHeader  = e.target.closest('.saved-folder-header');
+
+    clearDropMarkers();
+    document.querySelectorAll('.dragging').forEach(el => el.classList.remove('dragging'));
+
+    // Drop onto an "empty folder bar" placeholder → create + assign
+    if (folderEmpty) {
+      e.preventDefault();
+      const folder = await createFolder('New Folder');
+      if (data.type === 'domain')   await setDomainFolder(data.domain, folder.id);
+      if (data.type === 'deferred') await setDeferredFolder(data.id,    folder.id);
+      await renderStaticDashboard();
+      return;
+    }
+
+    // Drop onto folder chip / folder header → move into that folder
+    const folderTarget = folderChip || tabHeader || savedHeader;
+    if (folderTarget) {
+      e.preventDefault();
+      const folderId = folderTarget.dataset.folderId || null;
+      if (data.type === 'domain') {
+        // "All" chip (folderId === '') → null = unfile
+        await setDomainFolder(data.domain, folderId || null);
         await renderStaticDashboard();
-      } else if (data.type === 'deferred' && savedHeader) {
-        await setDeferredFolder(data.id, folderId);
+      } else if (data.type === 'deferred') {
+        await setDeferredFolder(data.id, folderId || null);
         await renderDeferredColumn();
       }
-    } catch {}
+      return;
+    }
+
+    // Drop onto another card → reorder within bucket
+    if (data.type === 'domain') {
+      const overCard = e.target.closest('.mission-card[data-domain]');
+      if (overCard && overCard.dataset.domain !== data.domain) {
+        e.preventDefault();
+        const r = overCard.getBoundingClientRect();
+        const before = (e.clientY - r.top) < r.height / 2;
+        await moveDomainBefore(data.domain, overCard.dataset.domain, before, overCard.dataset.folderId || null);
+        await renderStaticDashboard();
+      }
+    } else if (data.type === 'deferred') {
+      const overItem = e.target.closest('.deferred-item[data-deferred-id], .deferred-group[data-group-id]');
+      if (overItem) {
+        const overId = overItem.dataset.deferredId || overItem.dataset.groupId;
+        if (overId !== data.id) {
+          e.preventDefault();
+          const r = overItem.getBoundingClientRect();
+          const before = (e.clientY - r.top) < r.height / 2;
+          await moveDeferredBefore(data.id, overId, before);
+          await renderDeferredColumn();
+        }
+      }
+    }
   });
 })();
+
+/**
+ * moveDomainBefore(domain, targetDomain, before, folderId)
+ *
+ * Splices `domain` immediately before/after `targetDomain` in the saved
+ * order for the given folder bucket. Also updates the in-memory stable
+ * order so the next render reflects the change.
+ */
+async function moveDomainBefore(domain, targetDomain, before, folderId) {
+  // 1) Make sure both end up in the same folder bucket
+  if ((_domainFolderMap[domain] || null) !== (folderId || null)) {
+    await setDomainFolder(domain, folderId || null);
+    _domainFolderMap[domain] = folderId || null;
+  }
+
+  // 2) Update domainFolderOrder for the target bucket
+  const { domainFolderOrder = {} } = await chrome.storage.local.get('domainFolderOrder');
+  const key      = folderId || '__root__';
+  const inFolder = domainGroups
+    .filter(g => (_domainFolderMap[g.domain] || null) === (folderId || null))
+    .map(g => g.domain);
+  let order = (domainFolderOrder[key] || []).filter(d => inFolder.includes(d));
+  inFolder.forEach(d => { if (!order.includes(d)) order.push(d); });
+  order = order.filter(d => d !== domain);
+  let ti = order.indexOf(targetDomain);
+  if (ti < 0) ti = order.length;
+  order.splice(before ? ti : ti + 1, 0, domain);
+  domainFolderOrder[key] = order;
+  await chrome.storage.local.set({ domainFolderOrder });
+
+  // 3) Update the global stable order to match (so cards don't snap back)
+  _stableDomainOrder = _stableDomainOrder.filter(d => d !== domain);
+  let gi = _stableDomainOrder.indexOf(targetDomain);
+  if (gi < 0) gi = _stableDomainOrder.length;
+  _stableDomainOrder.splice(before ? gi : gi + 1, 0, domain);
+}
+
+/**
+ * moveDeferredBefore(itemId, targetId, before)
+ *
+ * Splice a saved item before/after another in the `deferred` array.
+ */
+async function moveDeferredBefore(itemId, targetId, before) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const fromIdx = deferred.findIndex(x => x.id === itemId);
+  if (fromIdx < 0) return;
+  const [item] = deferred.splice(fromIdx, 1);
+  let toIdx = deferred.findIndex(x => x.id === targetId);
+  if (toIdx < 0) toIdx = deferred.length;
+  deferred.splice(before ? toIdx : toIdx + 1, 0, item);
+  // Adopt the target's folder so reorders within a folder section make sense
+  const target = deferred.find(x => x.id === targetId);
+  if (target) item.folderId = target.folderId || null;
+  await chrome.storage.local.set({ deferred });
+}
 
 
 /* ----------------------------------------------------------------
@@ -1689,8 +1849,12 @@ function suppressAutoRefresh(ms = 1200) {
   }, ms);
 }
 
-function scheduleDashboardRefresh(delay = 400) {
+// Larger debounce window collapses bursts of tab events into a single render.
+// Combined with stable domain ordering, this prevents the "jumping cards" effect.
+function scheduleDashboardRefresh(delay = 600) {
   if (__autoRefreshSuppressed) return;
+  // Don't refresh while the user is dragging — would yank the dragged card out
+  if (document.querySelector('.dragging')) return;
   if (__renderDebounceTimer) clearTimeout(__renderDebounceTimer);
   __renderDebounceTimer = setTimeout(() => {
     __renderDebounceTimer = null;
@@ -1705,7 +1869,9 @@ if (typeof chrome !== 'undefined' && chrome.tabs) {
   chrome.tabs.onAttached.addListener(() => scheduleDashboardRefresh());
   chrome.tabs.onDetached.addListener(() => scheduleDashboardRefresh());
   chrome.tabs.onUpdated.addListener((_id, changeInfo) => {
-    if (changeInfo.url || changeInfo.title || changeInfo.status === 'complete') {
+    // Only refresh on changes that actually affect grouping/labels.
+    // Plain status:loading/complete pings without a URL change are ignored.
+    if (changeInfo.url || changeInfo.title) {
       scheduleDashboardRefresh();
     }
   });
