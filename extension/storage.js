@@ -297,3 +297,109 @@ export async function setWorkspaceIconOverride(name, icon) {
   else delete overrides[name];
   await chrome.storage.local.set({ workspaceIcons: overrides });
 }
+
+
+/* ----------------------------------------------------------------
+   FOLDER MANAGEMENT
+
+   Folders group open-tab domain cards and saved items together.
+   Data lives under three chrome.storage.local keys:
+     - 'folders'          → [{ id, name, createdAt, updatedAt, order }]
+     - 'domainFolderMap'  → { domain → folderId }
+     - 'domainFolderOrder'→ { folderId|'__root__' → [domain, ...] }
+
+   Saved items (deferred) each carry their own folderId field.
+   ---------------------------------------------------------------- */
+
+export async function getFolders() {
+  const { folders = [] } = await chrome.storage.local.get('folders');
+  return folders.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+}
+
+export async function saveFolders(arr) {
+  await chrome.storage.local.set({ folders: arr });
+}
+
+export async function createFolder(name) {
+  const folders = await getFolders();
+  const folder = {
+    id:        'f-' + Date.now(),
+    name:      (name || 'New Folder').trim(),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    order:     folders.length,
+  };
+  folders.push(folder);
+  await saveFolders(folders);
+  return folder;
+}
+
+export async function deleteFolder(id) {
+  // Remove the folder itself
+  const folders = (await getFolders()).filter(f => f.id !== id);
+  folders.forEach((f, i) => f.order = i);
+  await saveFolders(folders);
+
+  // Unfile any saved items that belonged to this folder
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  let dc = false;
+  deferred.forEach(x => { if (x.folderId === id) { x.folderId = null; dc = true; } });
+  if (dc) await chrome.storage.local.set({ deferred });
+
+  // Unfile any domain cards assigned to this folder
+  const { domainFolderMap = {} } = await chrome.storage.local.get('domainFolderMap');
+  let mc = false;
+  Object.keys(domainFolderMap).forEach(d => {
+    if (domainFolderMap[d] === id) { delete domainFolderMap[d]; mc = true; }
+  });
+  if (mc) await chrome.storage.local.set({ domainFolderMap });
+}
+
+export async function moveFolderOrder(id, dir) {
+  const folders = await getFolders();
+  const i = folders.findIndex(f => f.id === id);
+  const j = dir === 'up' ? i - 1 : i + 1;
+  if (i < 0 || j < 0 || j >= folders.length) return;
+  [folders[i], folders[j]] = [folders[j], folders[i]];
+  folders.forEach((f, k) => f.order = k);
+  await saveFolders(folders);
+}
+
+export async function setDomainFolder(domain, folderId) {
+  const { domainFolderMap = {} } = await chrome.storage.local.get('domainFolderMap');
+  if (folderId) domainFolderMap[domain] = folderId;
+  else          delete domainFolderMap[domain];
+  await chrome.storage.local.set({ domainFolderMap });
+  if (folderId) {
+    const folders = await getFolders();
+    const f = folders.find(x => x.id === folderId);
+    if (f) { f.updatedAt = Date.now(); await saveFolders(folders); }
+  }
+}
+
+export async function setDeferredFolder(itemId, folderId) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const item = deferred.find(x => x.id === itemId);
+  if (item) { item.folderId = folderId || null; item.updatedAt = Date.now(); }
+  await chrome.storage.local.set({ deferred });
+  if (folderId) {
+    const folders = await getFolders();
+    const f = folders.find(x => x.id === folderId);
+    if (f) { f.updatedAt = Date.now(); await saveFolders(folders); }
+  }
+}
+
+export async function reorderDeferredItem(itemId, dir) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const item = deferred.find(x => x.id === itemId);
+  if (!item) return;
+  const fid  = item.folderId || null;
+  const sibs = deferred.filter(x => !x.dismissed && !x.completed && (x.folderId || null) === fid);
+  const si   = sibs.findIndex(x => x.id === itemId);
+  const sj   = dir === 'up' ? si - 1 : si + 1;
+  if (si < 0 || sj < 0 || sj >= sibs.length) return;
+  const di = deferred.indexOf(sibs[si]);
+  const dj = deferred.indexOf(sibs[sj]);
+  [deferred[di], deferred[dj]] = [deferred[dj], deferred[di]];
+  await chrome.storage.local.set({ deferred });
+}

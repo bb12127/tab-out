@@ -45,9 +45,16 @@ import {
   migrateWorkspaceNames,
   getWorkspaceIconOverrides,
   setWorkspaceIconOverride,
+  getFolders,
+  saveFolders,
+  createFolder,
+  deleteFolder,
+  moveFolderOrder,
+  setDomainFolder,
+  setDeferredFolder,
 } from './storage.js';
 
-import { friendlyDomain, getGreeting, getDateDisplay } from './format.js';
+import { friendlyDomain, getGreeting, getDateDisplay, timeAgo } from './format.js';
 
 import {
   playCloseSound,
@@ -58,12 +65,22 @@ import {
 } from './effects.js';
 
 import {
+  escHtml,
   buildLiveWorkspaceMap,
+  FOLDER_SVG,
+  CHEVRON_DOWN,
+  CHEVRON_UP,
+  PENCIL_SVG,
+  TRASH_SVG,
+  ADD_FOLDER_SVG,
+  GEAR_SVG,
+  folderActionBtns,
   renderDomainCard,
   renderDeferredItem,
   renderArchiveItem,
   renderDeferredGroup,
   renderArchiveGroup,
+  renderSavedFolder,
 } from './render.js';
 
 import { openIconPicker, closeIconPicker } from './icon-picker.js';
@@ -71,30 +88,38 @@ import { openIconPicker, closeIconPicker } from './icon-picker.js';
 
 /* ----------------------------------------------------------------
    IN-MEMORY STORE FOR OPEN-TAB GROUPS
-
-   These two are the orchestrator's state — they're read by the
-   render pipeline below and read/written by the click handler.
    ---------------------------------------------------------------- */
 let domainGroups = [];
 
 // Opera GX workspace filter — null = "All", otherwise a workspaceId string
 let activeWorkspace = null;
 
+// Active folder filter — null = "All", folder id = show only that folder
+let activeFolderId = null;
+
+// Whether the folder management panel is open
+let _folderManagePanelOpen = false;
+
+// Last-loaded domain→folder map; kept in sync so reorderDomainCard can use it
+let _domainFolderMap = {};
+
+// Stable domain card ordering — preserves card positions across tab events.
+// New domains are appended; removed domains drop out. Only sorts by tab count
+// on first paint or after explicit user reorder.
+let _stableDomainOrder = [];
+
 
 /* ----------------------------------------------------------------
    TAB OUT DUPLICATE DETECTION
-
-   When the user opens multiple new tabs, each one is a separate
-   instance of this dashboard. The banner offers to close the extras.
    ---------------------------------------------------------------- */
 
 async function closeTabOutDupes() {
   const extensionId = chrome.runtime.id;
   const newtabUrl   = `chrome-extension://${extensionId}/index.html`;
 
-  const allTabs      = await chrome.tabs.query({});
+  const allTabs       = await chrome.tabs.query({});
   const currentWindow = await chrome.windows.getCurrent();
-  const tabOutTabs   = allTabs.filter(t => t.url === newtabUrl);
+  const tabOutTabs    = allTabs.filter(t => t.url === newtabUrl);
 
   if (tabOutTabs.length <= 1) return;
 
@@ -127,6 +152,149 @@ function checkTabOutDupes() {
 
 
 /* ----------------------------------------------------------------
+   FOLDER RENDER HELPERS — these live in app.js because they
+   read/write module-level state (activeFolderId, domainGroups,
+   _domainFolderMap) or mutate the DOM directly.
+   ---------------------------------------------------------------- */
+
+/**
+ * renderOpenTabsWithFolders(folders, dfMap, domainFolderOrder)
+ *
+ * Returns HTML for the open-tabs column, with folder section headers,
+ * per-folder domain cards, and an "Unfiled" separator at the bottom.
+ * Uses module state: domainGroups, activeFolderId.
+ */
+function renderOpenTabsWithFolders(folders, dfMap, domainFolderOrder) {
+  function orderedGroups(folderId) {
+    const key  = folderId || '__root__';
+    const inF  = domainGroups.filter(g => (dfMap[g.domain] || null) === (folderId || null));
+    const saved = (domainFolderOrder[key] || []).filter(d => inF.some(g => g.domain === d));
+    const rest  = inF.filter(g => !saved.includes(g.domain));
+    return [...saved.map(d => inF.find(g => g.domain === d)), ...rest].filter(Boolean);
+  }
+
+  // Folder-focused view — show only cards for the active folder
+  if (activeFolderId) {
+    const activeFolder = folders.find(f => f.id === activeFolderId);
+    const focusHeader = `
+      <div class="folder-focus-header">
+        <span class="folder-focus-header-name">
+          ${FOLDER_SVG}${activeFolder ? escHtml(activeFolder.name) : 'Folder'}
+        </span>
+        <span class="folder-focus-spacer"></span>
+        <button class="folder-focus-clear" data-action="filter-folder" data-folder-id="" title="Back to all tabs">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12"/></svg>
+          All tabs
+        </button>
+      </div>`;
+    const groups = orderedGroups(activeFolderId);
+    if (groups.length === 0) {
+      return focusHeader + `<div class="folder-empty-state">No open tabs in this folder yet.<br>Drag a card here or use the folder button on any card.</div>`;
+    }
+    return focusHeader + groups.map(g => renderDomainCard(g, activeFolderId, dfMap)).join('');
+  }
+
+  // "All" view — folder section headers + cards + unfiled
+  let html = '';
+  const hasFolderCards = folders.some(f => domainGroups.some(g => dfMap[g.domain] === f.id));
+
+  for (const folder of folders) {
+    const groups = orderedGroups(folder.id);
+    if (groups.length === 0) continue;
+    const ago = folder.updatedAt ? timeAgo(folder.updatedAt) : '';
+    html += `
+      <div class="tab-folder-header-card" data-action="toggle-tab-folder" data-folder-id="${folder.id}">
+        <svg class="tab-folder-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>
+        <span>${FOLDER_SVG}</span>
+        <span class="tab-folder-name">${escHtml(folder.name)}</span>
+        <span class="tab-folder-count">${groups.length}</span>
+        ${ago ? `<span class="tab-folder-updated">${ago}</span>` : ''}
+        <div class="tab-folder-actions">${folderActionBtns(folder.id)}</div>
+      </div>`;
+    for (const g of groups) html += renderDomainCard(g, folder.id, dfMap);
+  }
+
+  const unfiled = orderedGroups(null);
+  if (unfiled.length > 0 && hasFolderCards) {
+    html += `<div class="tab-unfiled-sep"><span class="tab-unfiled-label">Unfiled</span><div class="tab-unfiled-line"></div></div>`;
+  }
+  for (const g of unfiled) html += renderDomainCard(g, null, dfMap);
+  return html;
+}
+
+/**
+ * renderFolderBar(folders)
+ *
+ * Writes the folder chip strip into #folderBar. Shows "All" chip +
+ * one chip per folder + "New folder" + "Manage" button.
+ * Hidden entirely when no folders exist.
+ */
+function renderFolderBar(folders) {
+  const wrap = document.getElementById('folderBarWrap');
+  const bar  = document.getElementById('folderBar');
+  if (!bar || !wrap) return;
+
+  wrap.style.display = 'block';
+
+  let html = '';
+
+  if (folders.length > 0) {
+    const allActive = !activeFolderId ? ' active' : '';
+    const ALL_SVG = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25A2.25 2.25 0 0 1 13.5 18v-2.25Z"/></svg>`;
+    html += `<button class="folder-chip${allActive}" data-action="filter-folder" data-folder-id="">${ALL_SVG}All</button>`;
+
+    for (const f of folders) {
+      const isActive = activeFolderId === f.id;
+      html += `<button class="folder-chip${isActive ? ' active' : ''}" data-action="filter-folder" data-folder-id="${escHtml(f.id)}" data-folder-drop="1">${FOLDER_SVG}<span class="folder-chip-name">${escHtml(f.name)}</span></button>`;
+    }
+  } else {
+    html += `<span class="folder-bar-empty">No folders yet — drop a card here or click +</span>`;
+  }
+
+  html += `<button class="folder-chip-new" data-action="new-folder-bar" title="Create new folder">${ADD_FOLDER_SVG}New folder</button>`;
+  if (folders.length > 0) {
+    html += `<button class="folder-manage-toggle${_folderManagePanelOpen ? ' open' : ''}" data-action="toggle-folder-manage" title="Manage folders">${GEAR_SVG}Manage</button>`;
+  }
+
+  bar.innerHTML = html;
+}
+
+/**
+ * renderFolderManagePanel(folders)
+ *
+ * Writes the folder management panel (list of all folders with
+ * rename/delete/reorder actions) into #folderManagePanel.
+ */
+function renderFolderManagePanel(folders) {
+  const panel = document.getElementById('folderManagePanel');
+  if (!panel) return;
+
+  if (!_folderManagePanelOpen || folders.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+
+  panel.style.display = 'block';
+  let html = `<div class="folder-manage-list">`;
+  for (const f of folders) {
+    const isActive = activeFolderId === f.id;
+    html += `<div class="folder-manage-row${isActive ? ' is-active' : ''}" data-folder-id="${escHtml(f.id)}">
+      <span class="folder-manage-icon">${FOLDER_SVG}</span>
+      <span class="folder-manage-name">${escHtml(f.name)}</span>
+      <div class="folder-manage-btns">
+        <button data-action="folder-up"     data-folder-id="${escHtml(f.id)}" title="Move up">${CHEVRON_UP}</button>
+        <button data-action="folder-down"   data-folder-id="${escHtml(f.id)}" title="Move down">${CHEVRON_DOWN}</button>
+        <button data-action="rename-folder" data-folder-id="${escHtml(f.id)}" title="Rename">${PENCIL_SVG}</button>
+        <button class="danger" data-action="delete-folder" data-folder-id="${escHtml(f.id)}" title="Delete">${TRASH_SVG}</button>
+      </div>
+    </div>`;
+  }
+  html += `</div>`;
+  panel.innerHTML = html;
+}
+
+
+/* ----------------------------------------------------------------
    SAVED FOR LATER — Render Checklist Column
    ---------------------------------------------------------------- */
 
@@ -134,8 +302,8 @@ function checkTabOutDupes() {
  * renderDeferredColumn()
  *
  * Reads saved tabs from chrome.storage.local and renders the right-side
- * "Saved for Later" checklist column. Shows active items as a checklist
- * and completed items in a collapsible archive.
+ * "Saved for Later" checklist column. Respects activeFolderId to filter
+ * items when a folder is selected.
  */
 async function renderDeferredColumn() {
   const column         = document.getElementById('deferredColumn');
@@ -145,44 +313,85 @@ async function renderDeferredColumn() {
   const archiveEl      = document.getElementById('deferredArchive');
   const archiveCountEl = document.getElementById('archiveCount');
   const archiveList    = document.getElementById('archiveList');
+  const titleEl        = document.getElementById('deferredSectionTitle');
 
   if (!column) return;
 
   try {
-    // Read the raw deferred list so we can mutate + persist migrations.
     const { deferred = [] } = await chrome.storage.local.get('deferred');
     const storedIcons    = await getWorkspaceIconOverrides();
     const liveWorkspaces = buildLiveWorkspaceMap(getOpenTabs());
 
-    // Self-heal: if a workspace was renamed, update every saved group's
-    // stored name and migrate the emoji icon key. Writes back only when
-    // something actually changed.
+    // Self-heal workspace renames
     const { itemsChanged, iconsChanged } =
       migrateWorkspaceNames(deferred, storedIcons, liveWorkspaces);
     if (itemsChanged) await chrome.storage.local.set({ deferred });
     if (iconsChanged) await chrome.storage.local.set({ workspaceIcons: storedIcons });
 
-    // Derive visible subsets AFTER migration so render sees fresh names.
     const visible  = deferred.filter(t => !t.dismissed);
-    const active   = visible.filter(t => !t.completed);
+    let   active   = visible.filter(t => !t.completed);
     const archived = visible.filter(t => t.completed);
 
-    // Hide the entire column if there's nothing to show
-    if (active.length === 0 && archived.length === 0) {
+    // Resolve folder context
+    const folders = await getFolders();
+    let activeFolderName = null;
+    if (activeFolderId) {
+      const af = folders.find(f => f.id === activeFolderId);
+      activeFolderName = af ? af.name : null;
+      active = active.filter(x => x.folderId === activeFolderId);
+    }
+
+    if (titleEl) titleEl.textContent = activeFolderName || 'Saved for later';
+
+    // Nothing to show
+    if (active.length === 0 && (activeFolderId || archived.length === 0)) {
+      if (activeFolderId) {
+        // Show empty state for the focused folder
+        column.style.display = 'block';
+        list.innerHTML = `<div class="folder-empty-state">Nothing saved in this folder yet.</div>`;
+        list.style.display = 'block';
+        empty.style.display = 'none';
+        archiveEl.style.display = 'none';
+        countEl.textContent = '';
+        return;
+      }
       column.style.display = 'none';
       return;
     }
 
     column.style.display = 'block';
 
-    // Render active checklist items (mix of individual tabs and saved groups)
     if (active.length > 0) {
       countEl.textContent = `${active.length} item${active.length !== 1 ? 's' : ''}`;
-      list.innerHTML = active
-        .map(item => item.kind === 'group'
+      let html = '';
+
+      if (activeFolderId) {
+        // Focused folder — flat list
+        html += active.map(item => item.kind === 'group'
           ? renderDeferredGroup(item, storedIcons, liveWorkspaces)
-          : renderDeferredItem(item))
-        .join('');
+          : renderDeferredItem(item)
+        ).join('');
+      } else {
+        // "All" view — group by folder sections + unfiled
+        const hasFolderItems = folders.some(f => active.some(x => x.folderId === f.id));
+        for (const folder of folders) {
+          const inFolder = active.filter(x => x.folderId === folder.id);
+          if (inFolder.length === 0) continue;
+          html += renderSavedFolder(folder, inFolder, storedIcons, liveWorkspaces);
+        }
+        const unfiled = active.filter(x => !x.folderId);
+        if (unfiled.length > 0) {
+          if (hasFolderItems) {
+            html += `<div class="saved-unfiled-sep"><span class="saved-unfiled-label">Unfiled</span><div class="saved-unfiled-line"></div></div>`;
+          }
+          html += unfiled.map(item => item.kind === 'group'
+            ? renderDeferredGroup(item, storedIcons, liveWorkspaces)
+            : renderDeferredItem(item)
+          ).join('');
+        }
+      }
+
+      list.innerHTML = html;
       list.style.display = 'block';
       empty.style.display = 'none';
     } else {
@@ -191,8 +400,8 @@ async function renderDeferredColumn() {
       empty.style.display = 'block';
     }
 
-    // Render archive section (mix of individual tabs and archived groups)
-    if (archived.length > 0) {
+    // Archive section — hidden when a folder filter is active
+    if (archived.length > 0 && !activeFolderId) {
       archiveCountEl.textContent = `(${archived.length})`;
       archiveList.innerHTML = archived
         .map(item => item.kind === 'group'
@@ -221,9 +430,9 @@ async function renderDeferredColumn() {
  * The main render function:
  * 1. Paints greeting + date
  * 2. Fetches open tabs via chrome.tabs.query()
- * 3. Groups tabs by domain (with landing pages pulled out to their own group)
- * 4. Renders domain cards
- * 5. Updates footer stats
+ * 3. Groups tabs by domain
+ * 4. Renders folder bar + management panel
+ * 5. Renders domain cards (respecting folder filter)
  * 6. Renders the "Saved for Later" checklist
  */
 async function renderStaticDashboard() {
@@ -238,14 +447,9 @@ async function renderStaticDashboard() {
   const realTabs = getRealTabs();
 
   // --- Opera GX workspace filter bar ---
-  // Workspace icons live entirely in chrome.storage.local, keyed by workspace
-  // name. They're managed via the in-UI emoji picker (the pencil on each pill).
   const storedIcons = await getWorkspaceIconOverrides();
 
-  // Collect unique workspaces and remember the smallest tab.index in each, so
-  // we can present them in Opera GX's natural sidebar order (workspaces own
-  // contiguous ranges of tab indices, so min index ≈ leftmost in the sidebar).
-  const workspaceMap = new Map();  // workspaceId -> { name, icon, minIndex }
+  const workspaceMap = new Map();
   for (const t of realTabs) {
     if (!t.workspaceId) continue;
     const name = t.workspaceName || 'Workspace';
@@ -257,16 +461,12 @@ async function renderStaticDashboard() {
       existing.minIndex = idx;
     }
   }
-  // Sort entries by minIndex ascending — leftmost workspace first.
   const sortedWorkspaces = [...workspaceMap.entries()].sort(
     (a, b) => a[1].minIndex - b[1].minIndex
   );
-  // Reset filter if the active workspace no longer exists (deleted / all tabs closed).
   if (activeWorkspace && !workspaceMap.has(activeWorkspace)) {
     activeWorkspace = null;
   }
-  // Render the filter bar only when there are ≥2 workspaces. Non-Opera browsers
-  // return undefined workspaceId, so the Map stays empty and the bar stays hidden.
   const filterEl = document.getElementById('workspaceFilter');
   if (filterEl) {
     if (workspaceMap.size >= 2) {
@@ -274,7 +474,6 @@ async function renderStaticDashboard() {
       const iconHtml = (icon) => {
         if (!icon) return '';
         const str = String(icon);
-        // If it looks like an image URL, render as <img>; otherwise treat as emoji/text.
         if (/^(https?:|data:|chrome-extension:|\/)/i.test(str)) {
           return `<img class="workspace-btn-icon" src="${escape(str)}" alt="">`;
         }
@@ -298,8 +497,6 @@ async function renderStaticDashboard() {
     }
   }
 
-  // Apply the workspace filter before grouping — landing-page extraction,
-  // custom groups, and domain grouping all flow from filteredTabs.
   const filteredTabs = activeWorkspace
     ? realTabs.filter(t => t.workspaceId === activeWorkspace)
     : realTabs;
@@ -308,11 +505,8 @@ async function renderStaticDashboard() {
   domainGroups = [];
   const groupMap = {};
 
-  // Custom group rules from config.local.js (if any). The file is gitignored
-  // and not loaded by index.html by default — users can wire it up themselves.
   const customGroups = typeof LOCAL_CUSTOM_GROUPS !== 'undefined' ? LOCAL_CUSTOM_GROUPS : [];
 
-  // Check if a URL matches a custom group rule; returns the rule or null
   function matchCustomGroup(url) {
     try {
       const parsed = new URL(url);
@@ -324,14 +518,13 @@ async function renderStaticDashboard() {
             : false;
         if (!hostMatch) return false;
         if (r.pathPrefix) return parsed.pathname.startsWith(r.pathPrefix);
-        return true; // hostname matched, no path filter
+        return true;
       }) || null;
     } catch { return null; }
   }
 
   for (const tab of filteredTabs) {
     try {
-      // Check custom group rules first (e.g. merge subdomains, split by path)
       const customRule = matchCustomGroup(tab.url);
       if (customRule) {
         const key = customRule.groupKey;
@@ -355,8 +548,48 @@ async function renderStaticDashboard() {
     }
   }
 
-  // Sort by tab count descending — busiest domain first
-  domainGroups = Object.values(groupMap).sort((a, b) => b.tabs.length - a.tabs.length);
+  // STABLE ORDERING: preserve previous card positions across re-renders so
+  // tab events don't shuffle cards. New domains are sorted by tab count
+  // (desc) and appended after the already-known ones.
+  const allGroups = Object.values(groupMap);
+  const known     = new Set(_stableDomainOrder);
+  const present   = new Set(allGroups.map(g => g.domain));
+
+  // Drop any previously-known domains that no longer exist
+  _stableDomainOrder = _stableDomainOrder.filter(d => present.has(d));
+
+  // Append new domains, sorted by tab count desc (then alphabetical)
+  const newDomains = allGroups
+    .filter(g => !known.has(g.domain))
+    .sort((a, b) => {
+      const diff = b.tabs.length - a.tabs.length;
+      return diff !== 0 ? diff : a.domain.localeCompare(b.domain);
+    })
+    .map(g => g.domain);
+  _stableDomainOrder.push(...newDomains);
+
+  // Build domainGroups in the stable order
+  const byDomain = new Map(allGroups.map(g => [g.domain, g]));
+  domainGroups   = _stableDomainOrder.map(d => byDomain.get(d)).filter(Boolean);
+
+  // --- Load folder data ---
+  const [folders, dfMapRaw, { domainFolderOrder = {} }] = await Promise.all([
+    getFolders(),
+    chrome.storage.local.get('domainFolderMap'),
+    chrome.storage.local.get('domainFolderOrder'),
+  ]);
+  const dfMap = dfMapRaw.domainFolderMap || {};
+  _domainFolderMap = dfMap;
+
+  // Render folder bar + management panel — hide when there are no open tabs
+  // (no surface to organise yet)
+  const folderBarWrap = document.getElementById('folderBarWrap');
+  if (domainGroups.length === 0) {
+    if (folderBarWrap) folderBarWrap.style.display = 'none';
+  } else {
+    renderFolderBar(folders);
+    renderFolderManagePanel(folders);
+  }
 
   // --- Render domain cards ---
   const openTabsSection      = document.getElementById('openTabsSection');
@@ -365,13 +598,31 @@ async function renderStaticDashboard() {
   const openTabsSectionTitle = document.getElementById('openTabsSectionTitle');
 
   if (domainGroups.length > 0 && openTabsSection) {
-    if (openTabsSectionTitle) openTabsSectionTitle.textContent = 'Open tabs';
-    const dCount = domainGroups.length;
-    const tCount = filteredTabs.length;
-    openTabsSectionCount.textContent =
-      `${dCount} domain${dCount !== 1 ? 's' : ''} · ${tCount} tab${tCount !== 1 ? 's' : ''}`;
+    if (openTabsSectionTitle) {
+      if (activeFolderId) {
+        const af = folders.find(f => f.id === activeFolderId);
+        openTabsSectionTitle.textContent = af ? af.name : 'Folder';
+      } else {
+        openTabsSectionTitle.textContent = 'Open tabs';
+      }
+    }
+
+    if (activeFolderId) {
+      const folderGroups = domainGroups.filter(g => dfMap[g.domain] === activeFolderId);
+      const fTabs   = folderGroups.reduce((n, g) => n + g.tabs.length, 0);
+      const fDomains = folderGroups.length;
+      openTabsSectionCount.textContent = fDomains > 0
+        ? `${fDomains} domain${fDomains !== 1 ? 's' : ''} · ${fTabs} tab${fTabs !== 1 ? 's' : ''}`
+        : '';
+    } else {
+      const dCount = domainGroups.length;
+      const tCount = filteredTabs.length;
+      openTabsSectionCount.textContent =
+        `${dCount} domain${dCount !== 1 ? 's' : ''} · ${tCount} tab${tCount !== 1 ? 's' : ''}`;
+    }
+
     const playFlip = flipDomainCards(openTabsMissionsEl);
-    openTabsMissionsEl.innerHTML = domainGroups.map(g => renderDomainCard(g)).join('');
+    openTabsMissionsEl.innerHTML = renderOpenTabsWithFolders(folders, dfMap, domainFolderOrder);
     playFlip();
     openTabsSection.style.display = 'block';
   } else if (openTabsSection) {
@@ -394,12 +645,9 @@ async function renderDashboard() {
    EVENT HANDLERS — using event delegation
 
    One listener on document handles ALL button clicks.
-   Think of it as one security guard watching the whole building
-   instead of one per door.
    ---------------------------------------------------------------- */
 
 document.addEventListener('click', async (e) => {
-  // Walk up the DOM to find the nearest element with data-action
   const actionEl = e.target.closest('[data-action]');
   if (!actionEl) return;
 
@@ -408,7 +656,7 @@ document.addEventListener('click', async (e) => {
   // ---- Filter by Opera GX workspace ----
   if (action === 'filter-workspace') {
     const wsId = actionEl.dataset.workspaceId || null;
-    if (activeWorkspace === wsId) return;  // already active — no work to do
+    if (activeWorkspace === wsId) return;
     activeWorkspace = wsId;
     await renderStaticDashboard();
     return;
@@ -492,11 +740,11 @@ document.addEventListener('click', async (e) => {
 
   // ---- Close a single tab ----
   if (action === 'close-single-tab') {
-    e.stopPropagation(); // don't trigger parent chip's focus-tab
+    e.stopPropagation();
     const tabUrl = actionEl.dataset.tabUrl;
     if (!tabUrl) return;
 
-    // Close the tab in Chrome directly
+    suppressAutoRefresh();
     const allTabs = await chrome.tabs.query({});
     const match   = allTabs.find(t => t.url === tabUrl);
     if (match) await chrome.tabs.remove(match.id);
@@ -504,7 +752,6 @@ document.addEventListener('click', async (e) => {
 
     playCloseSound();
 
-    // Animate the chip row out
     const chip = actionEl.closest('.page-chip');
     if (chip) {
       const rect = chip.getBoundingClientRect();
@@ -514,7 +761,6 @@ document.addEventListener('click', async (e) => {
       chip.style.transform  = 'scale(0.8)';
       setTimeout(() => {
         chip.remove();
-        // If the card now has no tabs, remove it too
         const parentCard = document.querySelector('.mission-card:has(.mission-pages:empty)');
         if (parentCard) animateCardOut(parentCard);
         document.querySelectorAll('.mission-card').forEach(c => {
@@ -525,7 +771,6 @@ document.addEventListener('click', async (e) => {
       }, 200);
     }
 
-    // The chrome.tabs.onRemoved listener will auto-refresh the section count.
     showToast('Tab closed');
     return;
   }
@@ -537,10 +782,9 @@ document.addEventListener('click', async (e) => {
     const tabTitle = actionEl.dataset.tabTitle || tabUrl;
     if (!tabUrl) return;
 
-    // Find the source tab so we can remember its Opera GX workspace + position
+    suppressAutoRefresh();
     const sourceTab = getOpenTabs().find(t => t.url === tabUrl);
 
-    // Save to chrome.storage.local
     try {
       await saveTabForLater({
         url:           tabUrl,
@@ -556,13 +800,11 @@ document.addEventListener('click', async (e) => {
       return;
     }
 
-    // Close the tab in Chrome
     const allTabs = await chrome.tabs.query({});
     const match   = allTabs.find(t => t.url === tabUrl);
     if (match) await chrome.tabs.remove(match.id);
     await fetchOpenTabs();
 
-    // Animate chip out
     const chip = actionEl.closest('.page-chip');
     if (chip) {
       chip.style.transition = 'opacity 0.2s, transform 0.2s';
@@ -600,13 +842,10 @@ document.addEventListener('click', async (e) => {
     const id = actionEl.dataset.deferredId;
     if (!id) return;
 
-    // Pull the full record from storage so we get url + workspace + position together
     const { deferred = [] } = await chrome.storage.local.get('deferred');
     const stored = deferred.find(t => t.id === id);
     if (!stored || !stored.url) return;
 
-    // Build create options. Only include each field if we know it — undefined
-    // would shadow Chrome's defaults.
     const createOpts = { url: stored.url, active: false };
     if (stored.workspaceId != null) createOpts.workspaceId = stored.workspaceId;
     if (stored.windowId    != null) createOpts.windowId    = stored.windowId;
@@ -616,7 +855,6 @@ document.addEventListener('click', async (e) => {
     try {
       createdTab = await chrome.tabs.create(createOpts);
     } catch (err) {
-      // windowId may have closed since save — retry without it
       if (createOpts.windowId != null) {
         try {
           delete createOpts.windowId;
@@ -633,17 +871,12 @@ document.addEventListener('click', async (e) => {
       }
     }
 
-    // If a workspace was requested but didn't stick at creation, patch it on.
-    // Some Opera GX builds need workspaceId via tabs.update rather than create.
     if (stored.workspaceId != null && createdTab && createdTab.workspaceId !== stored.workspaceId) {
       try {
         await chrome.tabs.update(createdTab.id, { workspaceId: stored.workspaceId });
-      } catch {
-        // Older Opera GX may not support workspaceId on update — tab still opens.
-      }
+      } catch {}
     }
 
-    // Now that the tab is open, remove it from the saved-for-later list
     await dismissSavedTab(id);
 
     const item = actionEl.closest('.deferred-item');
@@ -651,7 +884,6 @@ document.addEventListener('click', async (e) => {
       item.classList.add('removing');
       setTimeout(() => {
         item.remove();
-        renderDeferredColumn();
         renderStaticDashboard();
       }, 300);
     } else {
@@ -664,6 +896,7 @@ document.addEventListener('click', async (e) => {
 
   // ---- Save the whole domain group for later (active checklist) ----
   if (action === 'save-domain-group' || action === 'archive-domain-group') {
+    suppressAutoRefresh();
     const directToArchive = action === 'archive-domain-group';
     const domainId = actionEl.dataset.domainId;
     const group    = domainGroups.find(g =>
@@ -671,26 +904,18 @@ document.addEventListener('click', async (e) => {
     );
     if (!group) return;
 
-    // Split tabs by Opera GX workspaceId so each workspace becomes its OWN
-    // saved group — makes it obvious which domain tabs came from which
-    // workspace when reviewing later. Tabs with no workspaceId (e.g. non-Opera)
-    // share a single bucket.
     const buckets = new Map();
     for (const tab of (group.tabs || [])) {
       const key = tab.workspaceId != null ? tab.workspaceId : '__none__';
       if (!buckets.has(key)) buckets.set(key, []);
       buckets.get(key).push(tab);
     }
-    // Preserve Opera GX sidebar ordering — bucket with the smallest tab
-    // index ends up first in the saved list.
     const bucketLists = [...buckets.values()].sort((a, b) => {
       const ai = Math.min(...a.map(t => (typeof t.index === 'number') ? t.index : Infinity));
       const bi = Math.min(...b.map(t => (typeof t.index === 'number') ? t.index : Infinity));
       return ai - bi;
     });
 
-    // Persist each bucket as its own group so renderDeferredGroup later
-    // shows one card per workspace with a clean single-workspace badge.
     const saveStart = Date.now();
     try {
       for (let i = 0; i < bucketLists.length; i++) {
@@ -705,10 +930,7 @@ document.addEventListener('click', async (e) => {
       return;
     }
 
-    // Close the browser tabs (reuse the same close rules as close-domain-tabs)
     const urls     = group.tabs.map(t => t.url);
-    // Custom groups (label set) match exact URLs because their synthetic
-    // group key isn't a real hostname. Regular domain groups match by hostname.
     const useExact = !!group.label;
     if (useExact) await closeTabsExact(urls);
     else          await closeTabsByUrls(urls);
@@ -718,11 +940,10 @@ document.addEventListener('click', async (e) => {
       animateCardOut(card);
     }
 
-    // Remove from in-memory groups so the card doesn't resurrect on next render
     const idx = domainGroups.indexOf(group);
     if (idx !== -1) domainGroups.splice(idx, 1);
 
-    const noun = directToArchive ? 'Archived' : 'Saved';
+    const noun       = directToArchive ? 'Archived' : 'Saved';
     const groupLabel = group.label || friendlyDomain(group.domain);
     const suffix     = bucketLists.length > 1 ? ` across ${bucketLists.length} workspaces` : '';
     showToast(`${noun} ${urls.length} tab${urls.length !== 1 ? 's' : ''} from ${groupLabel}${suffix}`);
@@ -749,14 +970,11 @@ document.addEventListener('click', async (e) => {
 
     const items = (group.items || []).filter(i => !i.dismissed);
     if (items.length === 0) {
-      // Nothing left to restore — just dismiss the now-empty group
       await dismissGroup(groupId);
       await renderDeferredColumn();
       return;
     }
 
-    // Restore every tab in its original workspace / index / window (best-effort).
-    // Sort by index ascending so inserts land in a predictable order.
     const sorted = [...items].sort((a, b) =>
       (a.index ?? Number.MAX_SAFE_INTEGER) - (b.index ?? Number.MAX_SAFE_INTEGER)
     );
@@ -769,7 +987,6 @@ document.addEventListener('click', async (e) => {
       try {
         created = await chrome.tabs.create(createOpts);
       } catch {
-        // windowId may have closed — retry without it
         if (createOpts.windowId != null) {
           try {
             delete createOpts.windowId;
@@ -783,14 +1000,12 @@ document.addEventListener('click', async (e) => {
           continue;
         }
       }
-      // Patch workspaceId if the create didn't honor it
       if (item.workspaceId != null && created && created.workspaceId !== item.workspaceId) {
         try { await chrome.tabs.update(created.id, { workspaceId: item.workspaceId }); }
         catch {}
       }
     }
 
-    // All tabs are open — dismiss the saved group entirely
     await dismissGroup(groupId);
     showToast(`Reopened ${items.length} tab${items.length !== 1 ? 's' : ''}`);
     await renderDeferredColumn();
@@ -839,7 +1054,6 @@ document.addEventListener('click', async (e) => {
       catch {}
     }
 
-    // Mark the item dismissed; auto-dismiss the group if it's now empty
     await dismissGroupItem(groupId, itemId);
 
     const itemRow = actionEl.closest('.group-item');
@@ -945,36 +1159,46 @@ document.addEventListener('click', async (e) => {
 
   // ---- Close all tabs in a domain group ----
   if (action === 'close-domain-tabs') {
+    suppressAutoRefresh();
     const domainId = actionEl.dataset.domainId;
-    const group    = domainGroups.find(g => {
-      return 'domain-' + g.domain.replace(/[^a-z0-9]/g, '-') === domainId;
-    });
+    const group    = domainGroups.find(g =>
+      'domain-' + g.domain.replace(/[^a-z0-9]/g, '-') === domainId
+    );
     if (!group) return;
 
     const urls     = group.tabs.map(t => t.url);
-    // Custom groups (label set) use a synthetic key as group.domain so we
-    // have to match by exact URL. Regular domain groups match by hostname.
     const useExact = !!group.label;
 
-    if (useExact) {
-      await closeTabsExact(urls);
-    } else {
-      await closeTabsByUrls(urls);
-    }
+    if (useExact) await closeTabsExact(urls);
+    else          await closeTabsByUrls(urls);
 
     if (card) {
       playCloseSound();
       animateCardOut(card);
     }
 
-    // Remove from in-memory groups
     const idx = domainGroups.indexOf(group);
     if (idx !== -1) domainGroups.splice(idx, 1);
 
     const groupLabel = group.label || friendlyDomain(group.domain);
     showToast(`Closed ${urls.length} tab${urls.length !== 1 ? 's' : ''} from ${groupLabel}`);
+    return;
+  }
 
-    // The chrome.tabs.onRemoved listener will auto-refresh the section count.
+  // ---- Close duplicates of a single URL (per-chip (2×) badge) ----
+  if (action === 'dedup-this-url') {
+    e.stopPropagation();
+    const tabUrl = actionEl.dataset.tabUrl;
+    if (!tabUrl) return;
+    suppressAutoRefresh();
+    await closeDuplicateTabs([tabUrl], true);
+    playCloseSound();
+    actionEl.style.transition = 'opacity 0.2s, transform 0.2s';
+    actionEl.style.opacity    = '0';
+    actionEl.style.transform  = 'scale(0.8)';
+    setTimeout(() => actionEl.remove(), 200);
+    showToast('Closed duplicates, kept one copy');
+    scheduleDashboardRefresh(800);
     return;
   }
 
@@ -987,12 +1211,10 @@ document.addEventListener('click', async (e) => {
     await closeDuplicateTabs(urls, true);
     playCloseSound();
 
-    // Hide the dedup button
     actionEl.style.transition = 'opacity 0.2s';
     actionEl.style.opacity    = '0';
     setTimeout(() => actionEl.remove(), 200);
 
-    // Remove dupe badges from the card
     if (card) {
       card.querySelectorAll('.chip-dupe-badge').forEach(b => {
         b.style.transition = 'opacity 0.2s';
@@ -1032,13 +1254,14 @@ document.addEventListener('click', (e) => {
 document.addEventListener('click', (e) => {
   const picker = document.getElementById('iconPicker');
   if (!picker || picker.style.display === 'none') return;
-  if (picker.contains(e.target)) return;                // click inside picker — fine
-  if (e.target.closest('[data-action="open-icon-picker"]')) return; // opening click — fine
+  if (picker.contains(e.target)) return;
+  if (e.target.closest('[data-action="open-icon-picker"]')) return;
   closeIconPicker();
 });
 
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
+  closeFolderPicker();
   const picker = document.getElementById('iconPicker');
   if (picker && picker.style.display !== 'none') closeIconPicker();
 });
@@ -1077,8 +1300,6 @@ document.addEventListener('input', async (e) => {
       return;
     }
 
-    // Match individual tabs by title/url. Match groups by label OR by any
-    // non-dismissed item inside the group matching title/url.
     const results = archived.filter(item => {
       if (item.kind === 'group') {
         if ((item.label || '').toLowerCase().includes(q)) return true;
@@ -1102,11 +1323,502 @@ document.addEventListener('input', async (e) => {
 
 
 /* ----------------------------------------------------------------
-   BROKEN-IMAGE FALLBACK
+   FOLDER ACTION HANDLERS — new-folder, rename, delete, reorder,
+   toggle-collapse, move-to-folder, deferred/domain reorder
+   ---------------------------------------------------------------- */
 
-   Extensions have strict CSP that disallows inline event handlers
-   like onerror="...", so we handle image-load failures globally.
-   `error` events don't bubble — use a capturing listener instead.
+document.addEventListener('click', async (e) => {
+  const a = e.target.closest('[data-action]');
+  if (!a) return;
+  const act = a.dataset.action;
+
+  // ---- Filter by folder (folder bar chip click) ----
+  if (act === 'filter-folder') {
+    const fid = a.dataset.folderId || null;
+    if (activeFolderId === fid) return;
+    activeFolderId = fid;
+    await renderStaticDashboard();
+    return;
+  }
+
+  // ---- Create new folder from the folder bar ----
+  if (act === 'new-folder-bar') {
+    const folder = await createFolder('New Folder');
+    _folderManagePanelOpen = true;
+    await renderStaticDashboard();
+    const nameEl = document.querySelector(`.folder-manage-row[data-folder-id="${folder.id}"] .folder-manage-name`);
+    if (nameEl) startFolderRename(nameEl, folder.id);
+    return;
+  }
+
+  // ---- Toggle folder management panel ----
+  if (act === 'toggle-folder-manage') {
+    _folderManagePanelOpen = !_folderManagePanelOpen;
+    const folders = await getFolders();
+    renderFolderManagePanel(folders);
+    document.querySelectorAll('[data-action="toggle-folder-manage"]')
+      .forEach(btn => btn.classList.toggle('open', _folderManagePanelOpen));
+    return;
+  }
+
+  // ---- Create new folder (section-level button) ----
+  if (act === 'new-folder') {
+    const folder = await createFolder('New Folder');
+    _folderManagePanelOpen = true;
+    await renderStaticDashboard();
+    const nameEl = document.querySelector(`.folder-manage-row[data-folder-id="${folder.id}"] .folder-manage-name`);
+    if (nameEl) startFolderRename(nameEl, folder.id);
+    return;
+  }
+
+  // ---- Toggle open-tabs folder collapse ----
+  if (act === 'toggle-tab-folder') {
+    e.stopPropagation();
+    const folderId = a.dataset.folderId;
+    a.classList.toggle('collapsed');
+    const collapsed = a.classList.contains('collapsed');
+    document.querySelectorAll(`.mission-card[data-folder-id="${folderId}"]`)
+      .forEach(c => c.classList.toggle('folder-hidden', collapsed));
+    return;
+  }
+
+  // ---- Toggle saved-column folder collapse ----
+  if (act === 'toggle-saved-folder') {
+    e.stopPropagation();
+    const folder = a.closest('.saved-folder');
+    if (folder) folder.classList.toggle('collapsed');
+    return;
+  }
+
+  // ---- Rename folder ----
+  if (act === 'rename-folder') {
+    e.stopPropagation();
+    const folderId = a.dataset.folderId;
+    const nameEl = document.querySelector(
+      `.folder-manage-row[data-folder-id="${folderId}"] .folder-manage-name,
+       [data-action="toggle-tab-folder"][data-folder-id="${folderId}"] .tab-folder-name,
+       [data-action="toggle-saved-folder"][data-folder-id="${folderId}"] .saved-folder-name`
+    );
+    if (nameEl) startFolderRename(nameEl, folderId);
+    return;
+  }
+
+  // ---- Delete folder ----
+  if (act === 'delete-folder') {
+    e.stopPropagation();
+    const folderId = a.dataset.folderId;
+    if (activeFolderId === folderId) activeFolderId = null;
+    await deleteFolder(folderId);
+    await renderStaticDashboard();
+    showToast('Folder deleted — items moved to unfiled');
+    return;
+  }
+
+  // ---- Reorder folder up / down ----
+  if (act === 'folder-up' || act === 'folder-down') {
+    e.stopPropagation();
+    const folderId = a.dataset.folderId;
+    await moveFolderOrder(folderId, act === 'folder-up' ? 'up' : 'down');
+    await renderStaticDashboard();
+    return;
+  }
+
+  // ---- Move domain card to folder (show picker) ----
+  if (act === 'move-domain-to-folder') {
+    e.stopPropagation();
+    const domain    = a.dataset.domain;
+    const currentFo = a.dataset.currentFolder || null;
+    const folders   = await getFolders();
+    showFolderPicker(a, folders, currentFo, async (folderId) => {
+      await setDomainFolder(domain, folderId);
+      await renderStaticDashboard();
+    });
+    return;
+  }
+
+  // ---- Move saved item to folder (show picker) ----
+  if (act === 'move-saved-to-folder') {
+    e.stopPropagation();
+    const itemId    = a.dataset.deferredId;
+    const currentFo = a.dataset.currentFolder || null;
+    const folders   = await getFolders();
+    showFolderPicker(a, folders, currentFo, async (folderId) => {
+      await setDeferredFolder(itemId, folderId);
+      await renderDeferredColumn();
+    });
+    return;
+  }
+
+});
+
+// ---- Folder picker: close on outside click ----
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.folder-picker')) closeFolderPicker();
+});
+
+
+/* ----------------------------------------------------------------
+   FOLDER PICKER POPOVER
+   ---------------------------------------------------------------- */
+
+let _folderPickerCallback = null;
+
+function showFolderPicker(anchor, folders, currentFolderId, onSelect) {
+  closeFolderPicker();
+  _folderPickerCallback = onSelect;
+
+  const picker = document.createElement('div');
+  picker.className = 'folder-picker';
+  picker.id = 'folderPicker';
+
+  const noFolderCls = !currentFolderId ? ' current' : '';
+  picker.innerHTML = `
+    <button class="folder-picker-item${noFolderCls}" data-pick-folder="">
+      <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12"/></svg>
+      No folder (unfiled)
+    </button>
+    ${folders.length ? '<div class="folder-picker-sep"></div>' : ''}
+    ${folders.map(f => {
+      const cls = f.id === currentFolderId ? ' current' : '';
+      return `<button class="folder-picker-item${cls}" data-pick-folder="${f.id}">
+        ${FOLDER_SVG} ${escHtml(f.name)}
+      </button>`;
+    }).join('')}`;
+
+  document.body.appendChild(picker);
+
+  const rect = anchor.getBoundingClientRect();
+  picker.style.top  = (rect.bottom + window.scrollY + 4) + 'px';
+  picker.style.left = (rect.left   + window.scrollX)     + 'px';
+
+  picker.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-pick-folder]');
+    if (!btn) return;
+    const fid = btn.dataset.pickFolder || null;
+    closeFolderPicker();
+    if (_folderPickerCallback) await _folderPickerCallback(fid);
+    _folderPickerCallback = null;
+  });
+}
+
+function closeFolderPicker() {
+  document.getElementById('folderPicker')?.remove();
+}
+
+
+/* ----------------------------------------------------------------
+   FOLDER NAME INLINE EDIT
+   ---------------------------------------------------------------- */
+
+function startFolderRename(nameEl, folderId) {
+  const oldName  = nameEl.textContent.trim();
+  const isTab    = nameEl.classList.contains('tab-folder-name');
+  const isManage = nameEl.classList.contains('folder-manage-name');
+  const cls      = isTab ? 'tab-folder-name-input'
+    : isManage   ? 'folder-manage-name-input'
+    :              'saved-folder-name-input';
+
+  const input = document.createElement('input');
+  input.className = cls;
+  input.value     = oldName;
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let saved = false;
+  async function save() {
+    if (saved) return;
+    saved = true;
+    const newName = input.value.trim() || oldName;
+    const folders = await getFolders();
+    const f = folders.find(x => x.id === folderId);
+    if (f) { f.name = newName; f.updatedAt = Date.now(); await saveFolders(folders); }
+    await renderStaticDashboard();
+  }
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter')  { e.preventDefault(); input.blur(); }
+    if (e.key === 'Escape') { input.value = oldName; input.blur(); }
+  });
+  input.addEventListener('blur', save);
+}
+
+
+/* ----------------------------------------------------------------
+   DRAG-AND-DROP — move domain cards and saved items into folders
+   ---------------------------------------------------------------- */
+
+(function initDragAndDrop() {
+  let _dragPayload = null;
+  const clearDropMarkers = () => {
+    document.querySelectorAll('.drop-target, .drop-before, .drop-after')
+      .forEach(el => el.classList.remove('drop-target', 'drop-before', 'drop-after'));
+  };
+
+  document.addEventListener('dragstart', (e) => {
+    // Don't start drag from interactive children (buttons, links, chips)
+    if (e.target.closest('button, a, input, .page-chip')) {
+      e.preventDefault();
+      return;
+    }
+    const card = e.target.closest('.mission-card[data-domain]');
+    if (card) {
+      _dragPayload = { type: 'domain', domain: card.dataset.domain, folderId: card.dataset.folderId || null };
+      e.dataTransfer.setData('text/plain', JSON.stringify(_dragPayload));
+      e.dataTransfer.effectAllowed = 'move';
+      card.classList.add('dragging');
+      return;
+    }
+    const item = e.target.closest('.deferred-item[data-deferred-id], .deferred-group[data-group-id]');
+    if (item) {
+      const id = item.dataset.deferredId || item.dataset.groupId;
+      _dragPayload = { type: 'deferred', id };
+      e.dataTransfer.setData('text/plain', JSON.stringify(_dragPayload));
+      e.dataTransfer.effectAllowed = 'move';
+      item.classList.add('dragging');
+    }
+  });
+
+  document.addEventListener('dragend', () => {
+    _dragPayload = null;
+    clearDropMarkers();
+    document.querySelectorAll('.dragging').forEach(el => el.classList.remove('dragging'));
+  });
+
+  document.addEventListener('dragover', (e) => {
+    if (!_dragPayload) return;
+    clearDropMarkers();
+
+    // 1) Folder chip / folder header / "All" chip → move to folder
+    const folderChip   = e.target.closest('.folder-chip[data-folder-id], .folder-bar-empty');
+    const tabHeader    = e.target.closest('.tab-folder-header-card');
+    const savedHeader  = e.target.closest('.saved-folder-header');
+    const folderTarget = folderChip || tabHeader || savedHeader;
+    if (folderTarget) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      folderTarget.classList.add('drop-target');
+      return;
+    }
+
+    // 2) Hover over another card / saved item → reorder
+    if (_dragPayload.type === 'domain') {
+      const overCard = e.target.closest('.mission-card[data-domain]');
+      if (overCard && overCard.dataset.domain !== _dragPayload.domain) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        const r = overCard.getBoundingClientRect();
+        const before = (e.clientY - r.top) < r.height / 2;
+        overCard.classList.add(before ? 'drop-before' : 'drop-after');
+      }
+    } else if (_dragPayload.type === 'deferred') {
+      const overItem = e.target.closest('.deferred-item[data-deferred-id], .deferred-group[data-group-id]');
+      if (overItem) {
+        const overId = overItem.dataset.deferredId || overItem.dataset.groupId;
+        if (overId !== _dragPayload.id) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          const r = overItem.getBoundingClientRect();
+          const before = (e.clientY - r.top) < r.height / 2;
+          overItem.classList.add(before ? 'drop-before' : 'drop-after');
+        }
+      }
+    }
+  });
+
+  document.addEventListener('dragleave', (e) => {
+    const target = e.target.closest(
+      '.tab-folder-header-card, .saved-folder-header, .folder-chip, .folder-bar-empty, .mission-card, .deferred-item, .deferred-group'
+    );
+    if (target) target.classList.remove('drop-target', 'drop-before', 'drop-after');
+  });
+
+  document.addEventListener('drop', async (e) => {
+    if (!_dragPayload) return;
+    const data = _dragPayload;
+    _dragPayload = null;
+
+    const folderChip   = e.target.closest('.folder-chip[data-folder-id]');
+    const folderEmpty  = e.target.closest('.folder-bar-empty');
+    const tabHeader    = e.target.closest('.tab-folder-header-card');
+    const savedHeader  = e.target.closest('.saved-folder-header');
+
+    clearDropMarkers();
+    document.querySelectorAll('.dragging').forEach(el => el.classList.remove('dragging'));
+
+    // Drop onto an "empty folder bar" placeholder → create + assign
+    if (folderEmpty) {
+      e.preventDefault();
+      const folder = await createFolder('New Folder');
+      if (data.type === 'domain')   await setDomainFolder(data.domain, folder.id);
+      if (data.type === 'deferred') await setDeferredFolder(data.id,    folder.id);
+      await renderStaticDashboard();
+      return;
+    }
+
+    // Drop onto folder chip / folder header → move into that folder
+    const folderTarget = folderChip || tabHeader || savedHeader;
+    if (folderTarget) {
+      e.preventDefault();
+      const folderId = folderTarget.dataset.folderId || null;
+      if (data.type === 'domain') {
+        // "All" chip (folderId === '') → null = unfile
+        await setDomainFolder(data.domain, folderId || null);
+        await renderStaticDashboard();
+      } else if (data.type === 'deferred') {
+        await setDeferredFolder(data.id, folderId || null);
+        await renderDeferredColumn();
+      }
+      return;
+    }
+
+    // Drop onto another card → reorder within bucket
+    if (data.type === 'domain') {
+      const overCard = e.target.closest('.mission-card[data-domain]');
+      if (overCard && overCard.dataset.domain !== data.domain) {
+        e.preventDefault();
+        const r = overCard.getBoundingClientRect();
+        const before = (e.clientY - r.top) < r.height / 2;
+        await moveDomainBefore(data.domain, overCard.dataset.domain, before, overCard.dataset.folderId || null);
+        await renderStaticDashboard();
+      }
+    } else if (data.type === 'deferred') {
+      const overItem = e.target.closest('.deferred-item[data-deferred-id], .deferred-group[data-group-id]');
+      if (overItem) {
+        const overId = overItem.dataset.deferredId || overItem.dataset.groupId;
+        if (overId !== data.id) {
+          e.preventDefault();
+          const r = overItem.getBoundingClientRect();
+          const before = (e.clientY - r.top) < r.height / 2;
+          await moveDeferredBefore(data.id, overId, before);
+          await renderDeferredColumn();
+        }
+      }
+    }
+  });
+})();
+
+/**
+ * moveDomainBefore(domain, targetDomain, before, folderId)
+ *
+ * Splices `domain` immediately before/after `targetDomain` in the saved
+ * order for the given folder bucket. Also updates the in-memory stable
+ * order so the next render reflects the change.
+ */
+async function moveDomainBefore(domain, targetDomain, before, folderId) {
+  // 1) Make sure both end up in the same folder bucket
+  if ((_domainFolderMap[domain] || null) !== (folderId || null)) {
+    await setDomainFolder(domain, folderId || null);
+    _domainFolderMap[domain] = folderId || null;
+  }
+
+  // 2) Update domainFolderOrder for the target bucket
+  const { domainFolderOrder = {} } = await chrome.storage.local.get('domainFolderOrder');
+  const key      = folderId || '__root__';
+  const inFolder = domainGroups
+    .filter(g => (_domainFolderMap[g.domain] || null) === (folderId || null))
+    .map(g => g.domain);
+  let order = (domainFolderOrder[key] || []).filter(d => inFolder.includes(d));
+  inFolder.forEach(d => { if (!order.includes(d)) order.push(d); });
+  order = order.filter(d => d !== domain);
+  let ti = order.indexOf(targetDomain);
+  if (ti < 0) ti = order.length;
+  order.splice(before ? ti : ti + 1, 0, domain);
+  domainFolderOrder[key] = order;
+  await chrome.storage.local.set({ domainFolderOrder });
+
+  // 3) Update the global stable order to match (so cards don't snap back)
+  _stableDomainOrder = _stableDomainOrder.filter(d => d !== domain);
+  let gi = _stableDomainOrder.indexOf(targetDomain);
+  if (gi < 0) gi = _stableDomainOrder.length;
+  _stableDomainOrder.splice(before ? gi : gi + 1, 0, domain);
+}
+
+/**
+ * moveDeferredBefore(itemId, targetId, before)
+ *
+ * Splice a saved item before/after another in the `deferred` array.
+ */
+async function moveDeferredBefore(itemId, targetId, before) {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const fromIdx = deferred.findIndex(x => x.id === itemId);
+  if (fromIdx < 0) return;
+  const [item] = deferred.splice(fromIdx, 1);
+  let toIdx = deferred.findIndex(x => x.id === targetId);
+  if (toIdx < 0) toIdx = deferred.length;
+  deferred.splice(before ? toIdx : toIdx + 1, 0, item);
+  // Adopt the target's folder so reorders within a folder section make sense
+  const target = deferred.find(x => x.id === targetId);
+  if (target) item.folderId = target.folderId || null;
+  await chrome.storage.local.set({ deferred });
+}
+
+
+/* ----------------------------------------------------------------
+   GLOBAL SEARCH — filters both columns in real time
+   ---------------------------------------------------------------- */
+
+function applySearch(query) {
+  const q = query.toLowerCase().trim();
+  const wrap = document.getElementById('searchBarWrap');
+  if (wrap) wrap.classList.toggle('has-query', q.length > 0);
+
+  // Filter open-tab domain cards
+  document.querySelectorAll('.mission-card[data-domain]').forEach(card => {
+    const domain = (card.dataset.domain || '').toLowerCase();
+    const titles = Array.from(card.querySelectorAll('.chip-text'))
+      .map(el => el.textContent.toLowerCase()).join(' ');
+    card.style.display = (!q || domain.includes(q) || titles.includes(q)) ? '' : 'none';
+  });
+
+  // Show/hide folder headers based on whether they have visible cards
+  document.querySelectorAll('.tab-folder-header-card[data-folder-id]').forEach(header => {
+    if (!q) { header.style.display = ''; return; }
+    const fid = header.dataset.folderId;
+    const anyVisible = Array.from(
+      document.querySelectorAll(`.mission-card[data-folder-id="${fid}"]`)
+    ).some(c => c.style.display !== 'none');
+    header.style.display = anyVisible ? '' : 'none';
+  });
+
+  // Filter saved items
+  document.querySelectorAll('.deferred-item[data-deferred-id]').forEach(item => {
+    const title  = (item.querySelector('.deferred-title')?.textContent || '').toLowerCase();
+    const domain = (item.querySelector('.deferred-meta span')?.textContent || '').toLowerCase();
+    item.style.display = (!q || title.includes(q) || domain.includes(q)) ? '' : 'none';
+  });
+
+  document.querySelectorAll('.deferred-group[data-group-id]').forEach(group => {
+    const label = (group.querySelector('.group-header-label')?.textContent || '').toLowerCase();
+    const texts = Array.from(group.querySelectorAll('.group-item-text'))
+      .map(el => el.textContent.toLowerCase()).join(' ');
+    group.style.display = (!q || label.includes(q) || texts.includes(q)) ? '' : 'none';
+  });
+
+  // Show/hide saved folder wrappers
+  document.querySelectorAll('.saved-folder[data-saved-folder-id]').forEach(sf => {
+    if (!q) { sf.style.display = ''; return; }
+    const anyVisible = Array.from(
+      sf.querySelectorAll('.deferred-item, .deferred-group')
+    ).some(el => el.style.display !== 'none');
+    sf.style.display = anyVisible ? '' : 'none';
+  });
+}
+
+document.addEventListener('input', (e) => {
+  if (e.target.id === 'searchBar') applySearch(e.target.value);
+});
+
+document.addEventListener('click', (e) => {
+  if (e.target.closest('#searchClearBtn')) {
+    const bar = document.getElementById('searchBar');
+    if (bar) { bar.value = ''; applySearch(''); }
+  }
+});
+
+
+/* ----------------------------------------------------------------
+   BROKEN-IMAGE FALLBACK
    ---------------------------------------------------------------- */
 document.addEventListener('error', (e) => {
   const el = e.target;
@@ -1119,13 +1831,30 @@ document.addEventListener('error', (e) => {
 /* ----------------------------------------------------------------
    LIVE TAB SYNC
 
-   Re-render the dashboard when tabs change OUTSIDE Tab Out (open / close /
-   move / navigate in another window). Debounced so a flurry of events
-   (e.g. closing many tabs at once) collapses to a single render.
+   Re-render the dashboard when tabs change OUTSIDE Tab Out.
+   Debounced so a flurry of events collapses to a single render.
+   suppressAutoRefresh() prevents double-renders after user actions
+   that already call fetchOpenTabs() directly.
    ---------------------------------------------------------------- */
 
 let __renderDebounceTimer = null;
-function scheduleDashboardRefresh(delay = 400) {
+let __autoRefreshSuppressed = false;
+let __autoRefreshSuppressTimer = null;
+
+function suppressAutoRefresh(ms = 1200) {
+  __autoRefreshSuppressed = true;
+  clearTimeout(__autoRefreshSuppressTimer);
+  __autoRefreshSuppressTimer = setTimeout(() => {
+    __autoRefreshSuppressed = false;
+  }, ms);
+}
+
+// Larger debounce window collapses bursts of tab events into a single render.
+// Combined with stable domain ordering, this prevents the "jumping cards" effect.
+function scheduleDashboardRefresh(delay = 600) {
+  if (__autoRefreshSuppressed) return;
+  // Don't refresh while the user is dragging — would yank the dragged card out
+  if (document.querySelector('.dragging')) return;
   if (__renderDebounceTimer) clearTimeout(__renderDebounceTimer);
   __renderDebounceTimer = setTimeout(() => {
     __renderDebounceTimer = null;
@@ -1139,10 +1868,10 @@ if (typeof chrome !== 'undefined' && chrome.tabs) {
   chrome.tabs.onMoved.addListener(()   => scheduleDashboardRefresh());
   chrome.tabs.onAttached.addListener(() => scheduleDashboardRefresh());
   chrome.tabs.onDetached.addListener(() => scheduleDashboardRefresh());
-  // onUpdated fires for every loading-progress tick — only refresh on
-  // changes that actually affect what we display (URL, title, completion).
   chrome.tabs.onUpdated.addListener((_id, changeInfo) => {
-    if (changeInfo.url || changeInfo.title || changeInfo.status === 'complete') {
+    // Only refresh on changes that actually affect grouping/labels.
+    // Plain status:loading/complete pings without a URL change are ignored.
+    if (changeInfo.url || changeInfo.title) {
       scheduleDashboardRefresh();
     }
   });

@@ -47,6 +47,27 @@
   </div>
 
   <!-- ================================================================
+       GLOBAL SEARCH BAR — filters both columns in real time
+       Hidden when empty; JS adds .has-query class when active.
+       ================================================================ -->
+  <div class="search-bar-wrap" id="searchBarWrap">
+    <svg class="search-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z"/></svg>
+    <input type="text" id="searchBar" placeholder="Search tabs &amp; saved…" autocomplete="off" spellcheck="false">
+    <button id="searchClearBtn" title="Clear search">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12"/></svg>
+    </button>
+  </div>
+
+  <!-- ================================================================
+       FOLDER BAR — chip strip for filtering by folder + management panel
+       Hidden when no folders exist (JS controls visibility).
+       ================================================================ -->
+  <div class="folder-bar-wrap" id="folderBarWrap" style="display:none">
+    <div class="folder-bar" id="folderBar"></div>
+    <div class="folder-manage-panel" id="folderManagePanel" style="display:none"></div>
+  </div>
+
+  <!-- ================================================================
        MAIN CONTENT AREA — two-column layout
        Left: open tabs (domain/mission cards)
        Right: saved for later checklist
@@ -57,7 +78,7 @@
     <!-- LEFT COLUMN: Open tabs -->
     <div class="active-section" id="openTabsSection" style="display:none">
       <div class="section-header">
-        <h2 id="openTabsSectionTitle">Right now</h2>
+        <h2 id="openTabsSectionTitle">Open tabs</h2>
         <div class="section-line"></div>
         <div class="section-count" id="openTabsSectionCount"></div>
       </div>
@@ -69,7 +90,7 @@
     <!-- RIGHT COLUMN: Saved for Later checklist -->
     <div class="deferred-column" id="deferredColumn" style="display:none">
       <div class="section-header">
-        <h2>Saved for later</h2>
+        <h2 id="deferredSectionTitle">Saved for later</h2>
         <div class="section-line"></div>
         <div class="section-count" id="deferredCount"></div>
       </div>
